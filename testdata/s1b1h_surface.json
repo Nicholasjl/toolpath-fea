@@ -1,0 +1,7 @@
+{
+  "source": "S1B1H-v0.1.0.3mf",
+  "source_sha256": "f9a57338d6ea33b7027f2031690fba6d2bfcfd7e3dd1189e2c7e1dca1d1d3282",
+  "preparation": "ASCII extraction in print coordinates, snapped to 0.0001 mm and duplicate/degenerate faces removed",
+  "fixture_sha256": "ccdc7d7c030dcbfe0cfa7bce7779bf458a3790c1c3c5d2e54d721cbb9ad482ea",
+  "reason": "Previous unconditional smoothing introduces 4 intersecting faces; closedness/Euler/volume alone did not catch this."
+}

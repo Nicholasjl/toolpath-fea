@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PathFEA Agent case v1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "vector": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "number"
+      }
+    },
+    "region": {
+      "oneOf": [
+        {
+          "enum": [
+            "X-",
+            "X+",
+            "Y-",
+            "Y+",
+            "Z-",
+            "Z+"
+          ]
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/vector"
+          }
+        }
+      ]
+    }
+  },
+  "properties": {
+    "mesh_mode": {
+      "enum": [
+        "voxel",
+        "tetra"
+      ],
+      "default": "voxel"
+    },
+    "snap_tolerance": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 0.01,
+      "default": 0.0001
+    },
+    "solver": {
+      "enum": [
+        "auto",
+        "direct",
+        "amg"
+      ],
+      "default": "auto"
+    },
+    "rtol": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 0.0001,
+      "default": 1e-09
+    },
+    "maxiter": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000,
+      "default": 2000
+    },
+    "chunk_size": {
+      "type": "integer",
+      "minimum": 128,
+      "maximum": 16384,
+      "default": 4096
+    },
+    "stl": {
+      "type": "string",
+      "default": ""
+    },
+    "gcode": {
+      "type": "string",
+      "default": ""
+    },
+    "size": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "number",
+        "exclusiveMinimum": 0
+      },
+      "default": [
+        40,
+        12,
+        8
+      ]
+    },
+    "pitch": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 2
+    },
+    "offset": {
+      "$ref": "#/$defs/vector",
+      "default": [
+        0,
+        0,
+        0
+      ]
+    },
+    "force": {
+      "$ref": "#/$defs/vector",
+      "default": [
+        0,
+        0,
+        -10
+      ]
+    },
+    "load_point": {
+      "$ref": "#/$defs/vector",
+      "description": "World-space force application point in mm; distributed equivalent force and moment on loaded surface."
+    },
+    "angle": {
+      "type": "number",
+      "default": 0
+    },
+    "build_axis": {
+      "enum": [
+        "X",
+        "Y",
+        "Z"
+      ],
+      "default": "Z"
+    },
+    "fixed": {
+      "$ref": "#/$defs/region",
+      "default": "X-"
+    },
+    "loaded": {
+      "$ref": "#/$defs/region",
+      "default": "X+"
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "e1": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "e2": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "e3": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "g12": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "g23": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "g13": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "nu12": {
+          "type": "number"
+        },
+        "nu23": {
+          "type": "number"
+        },
+        "nu13": {
+          "type": "number"
+        }
+      }
+    },
+    "surface_remesh_mm": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 5,
+      "default": 0,
+      "description": "Opt-in analysis surface conditioning target edge in mm; fixed 0.015 mm sampled deviation limit; 0 disables."
+    }
+  }
+}

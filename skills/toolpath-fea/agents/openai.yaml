@@ -1,0 +1,3 @@
+interface:
+  display_name: "PathFEA"
+  short_description: "Toolpath-aware 3D FEA and eccentric load analysis"
