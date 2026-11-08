@@ -1,0 +1,473 @@
+[
+  {
+    "name": "connector_m5",
+    "case": {
+      "stl": "../../pegboard_T_floating_connector_v1/round_pegboard_T_base_M5_6mm_16pitch_v1.stl",
+      "mesh_mode": "tetra",
+      "pitch": 3.7333333333333334,
+      "fixed": [
+        [
+          -28.56,
+          -0.56,
+          -24.56
+        ],
+        [
+          -21.28,
+          39.56,
+          24.56
+        ]
+      ],
+      "loaded": [
+        [
+          21.28,
+          -0.56,
+          -24.56
+        ],
+        [
+          28.56,
+          39.56,
+          24.56
+        ]
+      ],
+      "force": [
+        0,
+        -1,
+        0
+      ]
+    }
+  },
+  {
+    "name": "connector_m5_eccentric",
+    "case": {
+      "stl": "../../pegboard_T_floating_connector_v1/round_pegboard_T_base_M5_6mm_16pitch_v1.stl",
+      "mesh_mode": "tetra",
+      "pitch": 3.7333333333333334,
+      "fixed": [
+        [
+          -28.56,
+          -0.56,
+          -24.56
+        ],
+        [
+          -21.28,
+          39.56,
+          24.56
+        ]
+      ],
+      "loaded": [
+        [
+          21.28,
+          -0.56,
+          -24.56
+        ],
+        [
+          28.56,
+          39.56,
+          24.56
+        ]
+      ],
+      "force": [
+        0.0,
+        -9.80665,
+        0.0
+      ],
+      "load_point": [
+        24.92,
+        19.5,
+        10.0
+      ]
+    }
+  },
+  {
+    "name": "connector_hook",
+    "case": {
+      "stl": "../../pegboard_T_floating_connector_v1/round_pegboard_T_base_hook_6mm_16pitch_v1.stl",
+      "mesh_mode": "tetra",
+      "pitch": 3.7333333333333334,
+      "fixed": [
+        [
+          -28.56,
+          -9.160000381469727,
+          -24.56
+        ],
+        [
+          -21.28,
+          39.56,
+          24.56
+        ]
+      ],
+      "loaded": [
+        [
+          21.28,
+          -9.160000381469727,
+          -24.56
+        ],
+        [
+          28.56,
+          39.56,
+          24.56
+        ]
+      ],
+      "force": [
+        0,
+        -1,
+        0
+      ]
+    }
+  },
+  {
+    "name": "carriage",
+    "case": {
+      "stl": "../../pegboard_T_floating_connector_v1/skadis_edge_floating_carriage_240panel_v1.stl",
+      "mesh_mode": "tetra",
+      "pitch": 4.0,
+      "fixed": [
+        [
+          -7.1,
+          7.9,
+          -30.6
+        ],
+        [
+          8.999999618530273,
+          64.6,
+          -22.8
+        ]
+      ],
+      "loaded": [
+        [
+          -7.1,
+          7.9,
+          22.8
+        ],
+        [
+          8.999999618530273,
+          64.6,
+          30.6
+        ]
+      ],
+      "force": [
+        -1,
+        0,
+        0
+      ]
+    }
+  },
+  {
+    "name": "platform",
+    "case": {
+      "stl": "../../pegboard_platform_v1/v13支架.stl",
+      "mesh_mode": "tetra",
+      "pitch": 0.5,
+      "fixed": [
+        [
+          0.02862000197172165,
+          0.05911999486386776,
+          -0.04487999983131886
+        ],
+        [
+          0.035380006656050685,
+          0.07055999577045441,
+          0.004929150342941284
+        ]
+      ],
+      "loaded": [
+        [
+          0.02862000197172165,
+          0.13744000107049942,
+          -0.04487999983131886
+        ],
+        [
+          0.035380006656050685,
+          0.14888000197708606,
+          0.004929150342941284
+        ]
+      ],
+      "force": [
+        0,
+        0,
+        -1
+      ]
+    }
+  },
+  {
+    "name": "photo_clip",
+    "case": {
+      "stl": "../../photo_clip_v2_strength/photo_clip_v2_strength.stl",
+      "mesh_mode": "tetra",
+      "pitch": 2.8,
+      "fixed": [
+        [
+          -12.42,
+          -0.4200000000000001,
+          -0.42
+        ],
+        [
+          12.42,
+          5.04,
+          5.220000190734863
+        ]
+      ],
+      "loaded": [
+        [
+          -12.42,
+          36.96,
+          -0.42
+        ],
+        [
+          12.42,
+          42.42,
+          5.220000190734863
+        ]
+      ],
+      "force": [
+        0,
+        0,
+        -1
+      ]
+    }
+  },
+  {
+    "name": "hemisphere",
+    "case": {
+      "stl": "../../hemisphere_demo/hemisphere_D40.stl",
+      "mesh_mode": "tetra",
+      "pitch": 2.6666666666666665,
+      "fixed": [
+        [
+          -20.4,
+          -20.4,
+          -0.4
+        ],
+        [
+          -15.2,
+          20.4,
+          20.4
+        ]
+      ],
+      "loaded": [
+        [
+          15.2,
+          -20.4,
+          -0.4
+        ],
+        [
+          20.4,
+          20.4,
+          20.4
+        ]
+      ],
+      "force": [
+        0,
+        -1,
+        0
+      ]
+    }
+  },
+  {
+    "name": "splash_box",
+    "case": {
+      "stl": "../../socket_splash_box_v1_wall_thin_1_3_middle_v3/插座防溅盒v1_外壁变薄到1_3_中间面补薄_v3.stl",
+      "mesh_mode": "tetra",
+      "pitch": 6.866666666666666,
+      "fixed": [
+        [
+          -1.03,
+          -1.03,
+          -26.03
+        ],
+        [
+          94.03,
+          12.36,
+          51.027154235839845
+        ]
+      ],
+      "loaded": [
+        [
+          -1.03,
+          90.64,
+          -26.03
+        ],
+        [
+          94.03,
+          104.03,
+          51.027154235839845
+        ]
+      ],
+      "force": [
+        0,
+        0,
+        -1
+      ]
+    }
+  },
+  {
+    "name": "curve_coupon",
+    "case": {
+      "stl": "../../x2d_curve_coupon/X2D_curve_test_008.stl",
+      "mesh_mode": "tetra",
+      "pitch": 1.0666666666666667,
+      "fixed": [
+        [
+          -8.16,
+          -6.16,
+          -0.16
+        ],
+        [
+          -6.08,
+          6.16,
+          1.4399999713897704
+        ]
+      ],
+      "loaded": [
+        [
+          6.08,
+          -6.16,
+          -0.16
+        ],
+        [
+          8.16,
+          6.16,
+          1.4399999713897704
+        ]
+      ],
+      "force": [
+        0,
+        -1,
+        0
+      ]
+    }
+  },
+  {
+    "name": "curve_coupon_nonplanar",
+    "case": {
+      "stl": "../../x2d_curve_coupon/X2D_curve_test_008.stl",
+      "mesh_mode": "tetra",
+      "pitch": 1.0666666666666667,
+      "fixed": [
+        [
+          -8.16,
+          -6.16,
+          -0.16
+        ],
+        [
+          -6.08,
+          6.16,
+          1.4399999713897704
+        ]
+      ],
+      "loaded": [
+        [
+          6.08,
+          -6.16,
+          -0.16
+        ],
+        [
+          8.16,
+          6.16,
+          1.4399999713897704
+        ]
+      ],
+      "force": [
+        0,
+        -1,
+        0
+      ],
+      "gcode": "../../x2d_curve_coupon/X2D_curve_test_008.gcode"
+    },
+    "expected_error": "GCODE_ERROR"
+  },
+  {
+    "name": "curve_coupon_voxel_convergence",
+    "case": {
+      "stl": "../../x2d_curve_coupon/X2D_curve_test_008.stl",
+      "mesh_mode": "voxel",
+      "pitch": 0.5,
+      "fixed": [
+        [
+          -8.16,
+          -6.16,
+          -0.16
+        ],
+        [
+          -6.08,
+          6.16,
+          1.4399999713897704
+        ]
+      ],
+      "loaded": [
+        [
+          6.08,
+          -6.16,
+          -0.16
+        ],
+        [
+          8.16,
+          6.16,
+          1.4399999713897704
+        ]
+      ],
+      "force": [
+        0,
+        -1,
+        0
+      ]
+    },
+    "convergence": true
+  },
+  {
+    "name": "g5_toolpath_eccentric",
+    "case": {
+      "stl": "../../toolpath_fea/analyses/g5-base-1.1.0/baseline.stl",
+      "gcode": "../../toolpath_fea/analyses/g5-base-1.1.0/analysis_paths.gcode",
+      "mesh_mode": "tetra",
+      "pitch": 2,
+      "snap_tolerance": 0.0001,
+      "solver": "auto",
+      "fixed": [
+        [
+          0,
+          0,
+          -1
+        ],
+        [
+          260,
+          22,
+          6
+        ]
+      ],
+      "loaded": [
+        [
+          113,
+          109,
+          4.99
+        ],
+        [
+          123,
+          127,
+          5.01
+        ]
+      ],
+      "force": [
+        0,
+        -9.80665,
+        0
+      ],
+      "material": {
+        "e1": 2400,
+        "e2": 1500,
+        "e3": 1000,
+        "g12": 600,
+        "g23": 400,
+        "g13": 450,
+        "nu12": 0.3,
+        "nu23": 0.3,
+        "nu13": 0.3
+      },
+      "load_point": [
+        118,
+        118,
+        15
+      ]
+    }
+  }
+]

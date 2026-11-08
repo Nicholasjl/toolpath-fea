@@ -84,11 +84,14 @@ def stl_mesh(path,pitch):
     if np.any(count<1) or np.prod(count)>150000:
         raise ValueError('包围盒采样数过大或尺寸无效；请增大网格间距')
     ids=np.indices(count).reshape(3,-1).T
+    # Fit cells to the STL bounding box, as box_mesh does. A scalar pitch can
+    # otherwise truncate or extend a thin part by an entire partial layer.
+    cell_pitch=surface.extents/count
     inside=[]
     for chunk in np.array_split(ids,max(1,int(np.ceil(len(ids)/2000)))):
-        inside.append(surface.contains(origin+(chunk+.5)*pitch))
+        inside.append(surface.contains(origin+(chunk+.5)*cell_pitch))
     occupied=ids[np.concatenate(inside)]
-    return voxel_mesh(occupied,pitch,origin)
+    return voxel_mesh(occupied,cell_pitch,origin)
 
 
 def boundary_faces(cells):

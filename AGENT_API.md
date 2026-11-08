@@ -93,6 +93,12 @@ else:
 
 外层 `subprocess` 超时应长于工具自身时限，让工具有时间终止子进程并写结果。需要实时进度时用 `Popen` 并持续消费 stderr，避免管道写满。
 
+## Analysis preparation and voxel bounds (2026-11-08)
+
+Voxel cells now fit the STL bounding box along each axis (`extent / ceil(extent / pitch)`), consistent with the test-block mesh. This prevents truncation or extension of the final thin layer solely because the extent is not divisible by pitch. Curved boundaries still use center occupancy, so local geometric and mesh convergence checks remain necessary.
+
+For a part exported as overlapping positive-volume closed solids, explicitly run `python prepare_surface.py input.stl --output output/bonded.stl`. This performs a Manifold boolean union, preserves exterior bounds and saves an input/output hash and volume audit. It assumes the overlap is perfectly bonded. It rejects open shells, negative cavity shells and disconnected union results; it does not fill holes or model contact. Original files are unchanged. Use the prepared STL in a new case, and retain the audit with the result. This preparation requires `manifold3d`.
+
 ## Remote force point (CLI)
 
 Optional `load_point: [x,y,z]` is the world-space application point in mm. `force` remains the resultant in N. The selected `loaded` surface receives area-weighted nodal forces plus a distributed couple preserving both force and moment about the application point. This models an equivalent load transfer, not hook/contact mechanics or a rigid coupling. Omit the field for the original area-distributed load. A point 10 mm beyond the front of a Z=5 mm board has Z=15 mm. The GUI does not expose this field; use case JSON and run3d.py.

@@ -20,6 +20,8 @@ def tetra_mesh(path,pitch,snap_tolerance=1e-4,max_elements=600000,surface_remesh
         surface.vertices=np.round(surface.vertices/snap_tolerance)*snap_tolerance
         clean(surface)
     if not surface.is_watertight or not surface.is_winding_consistent:
+        if not source_closed:
+            raise ValueError('原始模型未闭合或朝向不一致，坐标清理后仍无效；请修复源模型，未自动补洞')
         raise ValueError('坐标清理改变了闭合拓扑，请减小 snap_tolerance，未自动填补孔洞')
     if surface.volume<0:surface.invert()
     relative_change=abs(surface.volume-original_volume)/max(original_volume,1e-20)

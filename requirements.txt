@@ -8,3 +8,4 @@ meshpy>=2026.1
 pyamg>=5.3
 
 pymeshlab>=2023.12
+manifold3d>=3.0

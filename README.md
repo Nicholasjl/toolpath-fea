@@ -40,6 +40,7 @@ CLI 的 stdout 为单个 JSON，stderr 为进度事件。输出清单 `output/ex
 - [Agent CLI 协议](AGENT_API.md) 与 [工况 schema](case.schema.json)
 - [二维使用说明](README_2D.md)
 - [求解器优化记录](SOLVER_OPTIMIZATION.md)
+- [本地工程集成测试](INTEGRATION_TESTS.md)：批量 CLI 测试入口、结果分类与实际工程记录。
 - [toolpath-fea skill](skills/toolpath-fea/SKILL.md)：可复制该目录至 Codex 的 skills 目录；使用时指定实际仓库路径。
 
 历史洞洞板原始模型、分析目录和大型基准输出不包含在仓库中；部分历史文档提到的本地路径需自行提供对应输入。`testdata` 包含表面处理回归用的小型几何数据及来源记录。
