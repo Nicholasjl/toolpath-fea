@@ -15,6 +15,8 @@ from matplotlib.cm import ScalarMappable
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from solver import read_gcode
 from solid import Material,box_mesh,stl_mesh,boundary_faces,select_faces,solve_solid,write_vtk
+from defaults import DEFAULT_MESH_MODE, DEFAULT_PITCH_MM
+from agent_worker import validate_case, diagnostics, convergence_check, metrics, check
 
 
 class SolidApp:
@@ -29,7 +31,7 @@ class SolidApp:
         tabs.add(geo,text='几何 / 走线'); tabs.add(mat,text='材料'); tabs.add(bc,text='约束 / 载荷')
         self.entry(geo,'stl','STL 路径（空=测试块）','')
         ttk.Button(geo,text='选择 STL',command=lambda:self.choose('stl','*.stl')).pack(fill='x')
-        for k,label,value in [('size','测试块 XYZ / mm','40,12,8'),('pitch','网格间距 / mm','2'),('gcode','G-code 路径（可选）','')]:
+        for k,label,value in [('size','测试块 XYZ / mm','40,12,8'),('pitch','目标网格尺度 / mm',str(DEFAULT_PITCH_MM)),('gcode','G-code 路径（可选）','')]:
             self.entry(geo,k,label,value)
         ttk.Button(geo,text='选择 G-code',command=lambda:self.choose('gcode','*.gcode *.gco')).pack(fill='x')
         self.entry(geo,'offset','路径 XYZ 平移 / mm','0,0,0')
@@ -37,7 +39,9 @@ class SolidApp:
         ttk.Label(geo,text='无 G-code 时打印层法线').pack(anchor='w',pady=(8,0))
         self.axis=tk.StringVar(value='Z'); ttk.Combobox(geo,textvariable=self.axis,values=['X','Y','Z'],state='readonly').pack(fill='x')
         ttk.Label(geo,text='网格：voxel 体素 / tetra 贴体四面体').pack(anchor='w')
-        self.mesh_mode=tk.StringVar(value='voxel');ttk.Combobox(geo,textvariable=self.mesh_mode,values=['voxel','tetra'],state='readonly').pack(fill='x')
+        self.mesh_mode=tk.StringVar(value=DEFAULT_MESH_MODE);ttk.Combobox(geo,textvariable=self.mesh_mode,values=['voxel','tetra'],state='readonly').pack(fill='x')
+        self.convergence=tk.BooleanVar(value=True)
+        ttk.Checkbutton(geo,text='两级网格细化检查（默认）',variable=self.convergence).pack(anchor='w')
         ttk.Label(geo,text='STL 坐标与 G-code 坐标保留不变。\n用 XYZ 平移对齐；不会自动缩放或居中。\nG-code 模式的层法线为世界 Z。\n预览中黑线显示挤出路径。',wraplength=320).pack(anchor='w',pady=14)
         for k,label in [('e1','沿线 E₁'),('e2','层内横向 E₂'),('e3','层间 E₃'),('g12','剪切 G₁₂'),('g23','剪切 G₂₃'),('g13','剪切 G₁₃'),('nu12','泊松比 ν₁₂'),('nu23','泊松比 ν₂₃'),('nu13','泊松比 ν₁₃')]:
             self.entry(mat,k,label+(' / MPa' if not k.startswith('nu') else ''),str(getattr(Material(),k)))
@@ -51,6 +55,7 @@ class SolidApp:
             ttk.Combobox(bc,textvariable=self.values[key],values=['X-','X+','Y-','Y+','Z-','Z+','空间盒'],state='readonly').pack(fill='x')
             self.entry(bc,key+'_box','盒范围 xmin,ymin,zmin,xmax,ymax,zmax','0,0,0,1,12,8' if key=='fixed' else '39,0,0,40,12,8')
         self.entry(bc,'force','总合力 Fx,Fy,Fz / N','0,0,-10')
+        self.entry(bc,'load_point','等效施力点 XYZ / mm（可选）','')
         ttk.Label(bc,text='X± 等选择全局包围盒极值平面上的表面。\n空间盒选择表面三角形中心位于盒内的区域。\n固定区：蓝；加载区：橙。\n力按选中表面面积分配。固定区三向位移为零。',wraplength=310).pack(anchor='w',pady=14)
         self.buttons=[]
         for text,cmd in [('预览网格 / 选区',lambda:self.start(False)),('运行三维分析',lambda:self.start(True)),('导出 JSON + VTK',self.export)]:
@@ -88,6 +93,7 @@ class SolidApp:
         if not path:return
         try:
             cfg=json.loads(Path(path).read_text(encoding='utf-8'));cfg=cfg.get('settings',cfg)
+            cfg=validate_case(cfg,Path(path).parent)
             for key in ('stl','gcode','pitch','angle'):self.values[key].set(str(cfg[key]))
             for key in ('size','offset','force'):self.values[key].set(','.join(map(str,cfg[key])))
             for key,value in cfg['material'].items():self.values[key].set(str(value))
@@ -96,7 +102,8 @@ class SolidApp:
                 self.values[key].set(value if isinstance(value,str) else '空间盒')
                 if not isinstance(value,str):self.values[key+'_box'].set(','.join(map(str,np.array(value).ravel())))
             self.axis.set(cfg['build_axis'])
-            self.mesh_mode.set(cfg.get('mesh_mode','voxel'));self.solver.set(cfg.get('solver','auto'))
+            self.mesh_mode.set(cfg.get('mesh_mode',DEFAULT_MESH_MODE));self.solver.set(cfg.get('solver','auto'))
+            self.values['load_point'].set(','.join(map(str,cfg.get('load_point',[]))))
             self.advanced={key:cfg.get(key,default) for key,default in {'surface_remesh_mm':0,'snap_tolerance':.0001,'rtol':1e-9,'maxiter':2000,'chunk_size':4096}.items()}
             self.result=None;self.mesh=None;self.draw();self.status.set('工况已载入，请重新预览或求解。')
         except Exception as exc:messagebox.showerror('载入失败',str(exc))
@@ -121,15 +128,17 @@ class SolidApp:
         regions={}
         for key in ('fixed','loaded'):
             regions[key]=np.array(self.vector(v[key+'_box'],6)).reshape(2,3).tolist() if v[key]=='空间盒' else v[key]
+        point={'load_point':self.vector(v['load_point'],3)} if v['load_point'].strip() else {}
         return dict(stl=v['stl'],size=self.vector(v['size'],3),pitch=float(v['pitch']),gcode=v['gcode'],
                     material={k:float(v[k]) for k in asdict(Material())},angle=float(v['angle']),build_axis=self.axis.get(),
-                    offset=self.vector(v['offset'],3),force=self.vector(v['force'],3),mesh_mode=self.mesh_mode.get(),solver=self.solver.get(),**self.advanced,**regions)
+                    offset=self.vector(v['offset'],3),force=self.vector(v['force'],3),mesh_mode=self.mesh_mode.get(),solver=self.solver.get(),**self.advanced,**regions,**point)
 
     def start(self,analysis):
         if self.busy:return
-        try:cfg=self.settings()
+        try:cfg=validate_case(self.settings(),Path.cwd())
         except Exception as exc:messagebox.showerror('参数错误',str(exc));return
         self.busy=True; self.output=None
+        want_convergence=self.convergence.get()
         for b in self.buttons:b.state(['disabled'])
         self.status.set('正在生成体网格'+('、映射走线并求解…' if analysis else '并选择表面…'))
         def worker():
@@ -147,9 +156,33 @@ class SolidApp:
                 mesh=dict(nodes=nodes,cells=cells,faces=faces,owners=owners,fixed=fixed,loaded=loaded,paths=paths)
                 chosen_solver=cfg['solver']
                 if chosen_solver=='auto' and mesh_info.get('mode')=='tetra' and mesh_info.get('quality_min',1)<1e-5:chosen_solver='direct'
-                result=solve_solid(nodes,cells,Material(**cfg['material']),fixed=cfg['fixed'],loaded=cfg['loaded'],force=cfg['force'],angle=cfg['angle'],build_axis=cfg['build_axis'],segments=paths,offset=cfg['offset'],solver=chosen_solver,**{k:cfg[k] for k in ('rtol','maxiter','chunk_size')}) if analysis else None
+                numerical={k:cfg[k] for k in ('fixed','loaded','force','angle','build_axis','offset','rtol','maxiter','chunk_size')}
+                if 'load_point' in cfg:numerical['load_point']=cfg['load_point']
+                result=solve_solid(nodes,cells,Material(**cfg['material']),segments=paths,solver=chosen_solver,**numerical) if analysis else None
                 if result is not None:
                     result['mesh_info']=mesh_info;result['solver_info']['requested']=cfg['solver']
+                    checks=diagnostics(cfg,result,paths)
+                    if want_convergence:
+                        try:
+                            fp=cfg['pitch']/1.5
+                            if cfg['stl'] and cfg['mesh_mode']=='tetra':
+                                fn,fc,fi=tetra_mesh(cfg['stl'],fp,cfg['snap_tolerance'],surface_remesh_mm=cfg['surface_remesh_mm'])
+                            else:
+                                fn,fc=stl_mesh(cfg['stl'],fp) if cfg['stl'] else box_mesh(cfg['size'],fp);fi={'mode':'voxel'}
+                            refined_solver=cfg['solver']
+                            if refined_solver=='auto' and fi.get('mode')=='tetra' and fi.get('quality_min',1)<1e-5:refined_solver='direct'
+                            fine=solve_solid(fn,fc,Material(**cfg['material']),segments=paths,solver=refined_solver,**numerical)
+                            fine['mesh_info']=fi;bm=metrics(result);fm=metrics(fine)
+                            du=abs(fm['max_displacement_mm']-bm['max_displacement_mm'])/max(fm['max_displacement_mm'],1e-20)
+                            ds=abs(fm['stress_p95_MPa']-bm['stress_p95_MPa'])/max(fm['stress_p95_MPa'],1e-20)
+                            checks.append(convergence_check(result,fine,du,ds,cfg['force']))
+                            result['refined_metrics']=fm
+                            del fine,fn,fc
+                        except ValueError as exc:
+                            checks.append(check('MESH_CONVERGENCE','not_checked','细化网格未完成，不能认定收敛',reason=str(exc)))
+                    else:checks.append(check('MESH_CONVERGENCE','not_checked','调用者关闭了网格收敛检查'))
+                    result['checks']=checks
+                    result['quality']='numerical_checks_passed' if all(c['status']=='pass' for c in checks) else 'needs_review'
                 self.output=('ok',(cfg,mesh,result))
             except Exception as exc:self.output=('error',str(exc))
         threading.Thread(target=worker,daemon=True).start();self.root.after(100,self.poll)
@@ -165,6 +198,7 @@ class SolidApp:
         summary=f"{len(m['nodes'])} 节点 / {len(m['cells'])} 四面体；固定 {m['fixed'].sum()} 面，加载 {m['loaded'].sum()} 面"
         if r is not None:
             summary+=f"\n最大位移 {np.linalg.norm(r['displacement'],axis=1).max():.5g} mm；反力 {r['reactions'].sum(axis=0).round(5)} N；残差 {r['relative_residual']:.2e}"
+            summary+='\n数值校核：'+r['quality']+'；'+', '.join(c['code']+'='+c['status'] for c in r['checks'] if c['status']!='pass')
             if m['paths'] is not None:summary+=f"；路径距离最大 {r['path_distance'].max():.3g} mm"
         self.status.set(summary);self.draw()
 

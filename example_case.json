@@ -2,6 +2,7 @@
   "stl": "",
   "size": [40, 12, 8],
   "pitch": 2,
+  "mesh_mode": "tetra",
   "gcode": "",
   "offset": [0, 0, 0],
   "angle": 0,

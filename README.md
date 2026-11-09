@@ -13,6 +13,8 @@ python run3d.py example_case.json --output output/example --timeout 300 --memory
 
 CLI 的 stdout 为单个 JSON，stderr 为进度事件。输出清单 `output/example.json` 中的 `artifacts` 指向本次报告、图片、NPZ 和 VTK；报告与图片需保存在同目录。默认例子是测试块，无需下载外部 STL。
 
+STL 默认采用质量四面体网格 `pq1.4Q`，允许边界细分；目标尺度从2mm起步，CLI和桌面均默认进行两档细化检查。实际体积网格未变细时，不会因位移接近而报告收敛通过。`voxel` 需显式选择。
+
 桌面界面：`python app3d.py`（Windows 可双击 `start3d.cmd`）。二维界面：`python app.py`。
 
 ## 三维能力

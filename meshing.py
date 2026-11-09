@@ -1,5 +1,20 @@
 """Conforming PLC tetrahedra via TetGen, with explicitly audited coordinate snapping."""
 import numpy as np
+from defaults import TETGEN_SWITCHES, MAX_VOLUME_RATIO, VOLUME_P95_RATIO
+
+
+def volume_resolution(info):
+    """Audit actual material-volume distribution, never just requested pitch."""
+    target=info.get('max_volume_target_mm3',0)
+    maximum=info.get('max_volume_actual_mm3')
+    p95=info.get('volume_weighted_p95_mm3')
+    known=bool(target>0 and maximum is not None and p95 is not None)
+    maximum_ratio=float(maximum/target) if known else None
+    p95_ratio=float(p95/target) if known else None
+    passed=known and maximum_ratio<=MAX_VOLUME_RATIO and p95_ratio<=VOLUME_P95_RATIO
+    return dict(status='pass' if passed else 'warn' if known else 'not_checked',
+                max_volume_ratio=maximum_ratio,volume_weighted_p95_ratio=p95_ratio,
+                max_volume_ratio_limit=MAX_VOLUME_RATIO,volume_weighted_p95_ratio_limit=VOLUME_P95_RATIO)
 
 
 def tetra_mesh(path,pitch,snap_tolerance=1e-4,max_elements=600000,surface_remesh_mm=0):
@@ -55,7 +70,7 @@ def tetra_mesh(path,pitch,snap_tolerance=1e-4,max_elements=600000,surface_remesh
     # Conditioning is opt-in. Retry a rejected PLC once, on a separately audited
     # smoothed copy of the ORIGINAL snapped surface, never on an accumulated edit.
     try:
-        mesh=build(info,options=Options('pYQ'),max_volume=pitch**3/6)
+        mesh=build(info,options=Options(TETGEN_SWITCHES),max_volume=pitch**3/6)
         attempts.append(dict(smoothing=False,status='completed'))
     except RuntimeError as exc:
         attempts.append(dict(smoothing=False,status='rejected',error=str(exc)))
@@ -66,7 +81,7 @@ def tetra_mesh(path,pitch,snap_tolerance=1e-4,max_elements=600000,surface_remesh
             raise ValueError('备用表面预处理累计体积变化超过 0.1%')
         info,holes=build_domain(surface)
         try:
-            mesh=build(info,options=Options('pYQ'),max_volume=pitch**3/6)
+            mesh=build(info,options=Options(TETGEN_SWITCHES),max_volume=pitch**3/6)
             attempts.append(dict(smoothing=True,status='completed'))
         except RuntimeError as retry:
             raise ValueError(f'两种经校验的表面策略均被 TetGen 拒绝：{exc}；{retry}') from retry
@@ -88,11 +103,15 @@ def tetra_mesh(path,pitch,snap_tolerance=1e-4,max_elements=600000,surface_remesh
     # Mean-ratio quality: 1 for equilateral, approaches zero for degenerate tetrahedra.
     lengths=sum(np.sum((p[:,a]-p[:,b])**2,axis=1) for a in range(4) for b in range(a))
     quality=12*(3*volumes)**(2/3)/lengths
+    ordered=np.sort(volumes)
+    weighted_p95=float(ordered[np.searchsorted(np.cumsum(ordered),.95*ordered.sum())])
     return nodes,cells,dict(mode='tetra',source_volume_mm3=original_volume,volume_relative_error=float(volume_error),
         snap_tolerance_mm=snap_tolerance,snapped_volume_relative_change=float(relative_change),surface_faces=len(surface.faces),
         source_closed_before_snap=source_closed,surface_conditioning=remesh_info,tetgen_attempts=attempts,
         max_volume_target_mm3=pitch**3/6,max_volume_actual_mm3=float(volumes.max()),
-        boundary_refinement=False,quality_min=float(quality.min()),quality_p01=float(np.percentile(quality,1)),
+        tetgen_switches=TETGEN_SWITCHES,quality_refinement=True,boundary_refinement=True,
+        volume_p95_mm3=float(np.percentile(volumes,95)),volume_weighted_p95_mm3=weighted_p95,
+        quality_min=float(quality.min()),quality_p01=float(np.percentile(quality,1)),
         low_quality_fraction=float(np.mean(quality<.01)),cavities=len(holes),
         numeric_flat_tets_removed=removed_count,numeric_flat_volume_mm3=removed_volume)
 

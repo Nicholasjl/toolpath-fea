@@ -41,7 +41,8 @@
         "voxel",
         "tetra"
       ],
-      "default": "voxel"
+      "default": "tetra",
+      "description": "STL default: quality tetrahedra with boundary refinement (TetGen pq1.4Q); voxel remains explicit opt-in."
     },
     "snap_tolerance": {
       "type": "number",
@@ -100,7 +101,8 @@
     "pitch": {
       "type": "number",
       "exclusiveMinimum": 0,
-      "default": 2
+      "default": 2,
+      "description": "Initial mesh scale in mm, not an accuracy guarantee. Tetra target volume is pitch^3/6; verify actual volume sizes and two-level refinement."
     },
     "offset": {
       "$ref": "#/$defs/vector",

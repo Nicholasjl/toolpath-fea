@@ -9,6 +9,8 @@ import numpy as np
 from scipy.spatial import cKDTree
 from solid import Material,local_stiffness,box_mesh,stl_mesh,boundary_faces,select_faces,solve_solid,write_vtk
 from solver import read_gcode
+from defaults import DEFAULT_MESH_MODE, DEFAULT_PITCH_MM, REFINED_VOLUME_RATIO
+from meshing import volume_resolution
 
 
 class JobError(Exception):
@@ -21,9 +23,9 @@ def validate_case(cfg,base):
     allowed={'stl','size','pitch','gcode','offset','angle','build_axis','material','fixed','loaded','force',
              'mesh_mode','snap_tolerance','solver','rtol','maxiter','chunk_size','load_point','surface_remesh_mm'}
     if set(cfg)-allowed:raise JobError('INVALID_CASE',f'未知工况字段：{sorted(set(cfg)-allowed)}')
-    cfg={'stl':'','size':[40,12,8],'pitch':2,'gcode':'','offset':[0,0,0],'angle':0,
+    cfg={'stl':'','size':[40,12,8],'pitch':DEFAULT_PITCH_MM,'gcode':'','offset':[0,0,0],'angle':0,
          'build_axis':'Z','material':{},'fixed':'X-','loaded':'X+','force':[0,0,-10],
-         'mesh_mode':'voxel','snap_tolerance':.0001,'surface_remesh_mm':0,'solver':'auto','rtol':1e-9,'maxiter':2000,'chunk_size':4096,**cfg}
+         'mesh_mode':DEFAULT_MESH_MODE,'snap_tolerance':.0001,'surface_remesh_mm':0,'solver':'auto','rtol':1e-9,'maxiter':2000,'chunk_size':4096,**cfg}
     def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
     for key in ('pitch','angle'):
         if not number(cfg[key]):raise JobError('INVALID_CASE',f'{key} 必须为有限数值')
@@ -89,7 +91,10 @@ def diagnostics(cfg,r,segments):
     if cfg['stl'] and r.get('mesh_info',{}).get('mode')=='tetra':
         info=r['mesh_info']
         checks.append(check('GEOMETRY_APPROXIMATION','pass' if info['volume_relative_error']<.002 else 'warn','贴体四面体保留清理后的表面；数值清理容差与体积偏差已记录',**info))
-        checks.append(check('ELEMENT_QUALITY','warn' if info['low_quality_fraction']>.001 or info['quality_min']<1e-6 else 'pass','保留原表面可能产生扁薄单元；需结合原始系统残差与收敛检查',quality_min=info['quality_min'],low_quality_fraction=info['low_quality_fraction']))
+        checks.append(check('ELEMENT_QUALITY','warn' if info['low_quality_fraction']>.001 or info['quality_min']<1e-6 else 'pass','几何细节附近仍可能产生扁薄单元；需结合原始系统残差与收敛检查',quality_min=info['quality_min'],low_quality_fraction=info['low_quality_fraction']))
+        sizing=volume_resolution(info)
+        checks.append(check('MESH_VOLUME_SIZE',sizing.pop('status'),
+                            '实际单元体积及按材料体积加权的p95与目标比较；表面节点数不能替代体积细化',**sizing))
     elif cfg['stl']:
         import trimesh
         surface=trimesh.load_mesh(cfg['stl']);source_volume=abs(float(surface.volume))
@@ -122,8 +127,19 @@ def convergence_check(base,fine,du,ds,force):
     unchanged=(np.array_equal(base['nodes'],fine['nodes']) and np.array_equal(base['cells'],fine['cells']))
     status='not_checked' if unchanged else 'pass' if du<=.1 and ds<=.15 and np.linalg.norm(force)>0 else 'warn'
     message='网格未实际变化，不能据此认定收敛' if unchanged else '两级网格最大位移及全局应力 p95 比较；不构成完整收敛证明'
+    refinement={}
+    bi=base.get('mesh_info',{});fi=fine.get('mesh_info',{})
+    if bi.get('mode')=='tetra' or fi.get('mode')=='tetra':
+        bv=bi.get('volume_weighted_p95_mm3');fv=fi.get('volume_weighted_p95_mm3')
+        ratio=float(fv/bv) if bv and fv is not None else None
+        sizing_ok=all(volume_resolution(info)['status']=='pass' for info in (bi,fi))
+        enabled=all(info.get('quality_refinement') and info.get('boundary_refinement') for info in (bi,fi))
+        refinement=dict(volume_weighted_p95_refinement_ratio=ratio,refinement_ratio_limit=REFINED_VOLUME_RATIO,
+                        sizing_checks_passed=sizing_ok,quality_and_boundary_refinement_enabled=bool(enabled))
+        if not sizing_ok or not enabled or ratio is None or ratio>REFINED_VOLUME_RATIO:
+            status='not_checked';message='未证明实际体积网格充分细化，位移接近不能认定收敛'
     return check('MESH_CONVERGENCE',status,message,mesh_unchanged=unchanged,
-                 displacement_relative_change=du,stress_p95_relative_change=ds,displacement_tolerance=.1,stress_tolerance=.15)
+                 displacement_relative_change=du,stress_p95_relative_change=ds,displacement_tolerance=.1,stress_tolerance=.15,**refinement)
 
 
 def metrics(r):
@@ -222,7 +238,10 @@ def worker_main(queue,cfg,base,directory,options):
                 ds=abs(fm['stress_p95_MPa']-bm['stress_p95_MPa'])/max(fm['stress_p95_MPa'],1e-20)
                 checks.append(convergence_check(r,fine,du,ds,cfg['force']))
                 if r['mesh_info']['mode']=='tetra':
-                    checks.append(check('BOUNDARY_REFINEMENT','not_checked','贴体模式保留输入表面三角形；pitch 只约束可插入内点，需独立细化表面验证薄壁弯曲收敛',base_elements=len(r['cells']),refined_elements=len(fine['cells'])))
+                    enabled=bool(r['mesh_info'].get('boundary_refinement') and fine['mesh_info'].get('boundary_refinement'))
+                    checks.append(check('BOUNDARY_REFINEMENT','pass' if enabled else 'not_checked',
+                                        '边界细分已启用；仅证明允许细分，不单独证明薄壁或局部应力收敛',
+                                        base_elements=len(r['cells']),refined_elements=len(fine['cells'])))
                 runs.append(dict(name='refined',pitch=refined['pitch'],angle=refined['angle'],metrics=fm))
                 write_npz(out/'refined.npz',fine);del fine
             except ValueError as exc:
