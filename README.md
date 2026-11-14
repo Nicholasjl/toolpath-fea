@@ -60,3 +60,9 @@ python -m unittest discover -p "test_*.py"
 本工具用于数值筛查。默认材料参数是演示值，未对应具体耗材和打印工艺标定。线弹性结果不预测层间开裂、塑性、接触、蠕变、屈曲或断裂；von Mises 不是打印材料的通用失效判据。
 
 退出码 0 仅表示计算流程完成，仍需检查 `analysis.quality`、平衡、网格收敛及边界条件。体积保留、低残差或方向覆盖通过，不等于薄壁应力收敛，更不等于安全承重。
+
+## 许可证
+
+Copyright 2026 PathFEA contributors.
+
+本项目采用 [Apache License 2.0](LICENSE)（SPDX: `Apache-2.0`）。第三方依赖仍遵循各自的许可证。
