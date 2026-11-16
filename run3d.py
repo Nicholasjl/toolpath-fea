@@ -36,6 +36,9 @@ def worker_entry(*args):
     # Native mesh libraries can print outside Python: isolate fd 1 from protocol stdout.
     native_log=open(Path(args[3])/'native.log','w',encoding='utf-8')
     os.dup2(native_log.fileno(),1)
+    # Native meshers may write diagnostic files with fixed names. Keep each
+    # worker's side effects in its unique run directory, including on failure.
+    os.chdir(args[3])
     try:
         from agent_worker import worker_main
     except Exception as exc:

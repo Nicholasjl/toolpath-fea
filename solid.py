@@ -102,6 +102,13 @@ def boundary_faces(cells):
 
 
 def select_faces(nodes,faces,region):
+    if isinstance(region,dict):
+        if set(region)!={'boxes'} or not isinstance(region['boxes'],list) or not region['boxes']:
+            raise ValueError('选区并集必须包含非空 boxes 列表')
+        masks=[select_faces(nodes,faces,box) for box in region['boxes']]
+        if any(not mask.any() for mask in masks):
+            raise ValueError('选区并集中的一个子区域没有选中表面；不能静默丢失安装点')
+        return np.logical_or.reduce(masks)
     centers=nodes[faces].mean(axis=1)
     if isinstance(region,str):
         axis='XYZ'.index(region[0]); edge=nodes[:,axis].min() if region[1]=='-' else nodes[:,axis].max()

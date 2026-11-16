@@ -70,7 +70,7 @@ def tetra_mesh(path,pitch,snap_tolerance=1e-4,max_elements=600000,surface_remesh
     # Conditioning is opt-in. Retry a rejected PLC once, on a separately audited
     # smoothed copy of the ORIGINAL snapped surface, never on an accumulated edit.
     try:
-        mesh=build(info,options=Options(TETGEN_SWITCHES),max_volume=pitch**3/6)
+        mesh=build(info,options=Options(TETGEN_SWITCHES,quiet=False),max_volume=pitch**3/6,verbose=True)
         attempts.append(dict(smoothing=False,status='completed'))
     except RuntimeError as exc:
         attempts.append(dict(smoothing=False,status='rejected',error=str(exc)))
@@ -81,7 +81,7 @@ def tetra_mesh(path,pitch,snap_tolerance=1e-4,max_elements=600000,surface_remesh
             raise ValueError('备用表面预处理累计体积变化超过 0.1%')
         info,holes=build_domain(surface)
         try:
-            mesh=build(info,options=Options(TETGEN_SWITCHES),max_volume=pitch**3/6)
+            mesh=build(info,options=Options(TETGEN_SWITCHES,quiet=False),max_volume=pitch**3/6,verbose=True)
             attempts.append(dict(smoothing=True,status='completed'))
         except RuntimeError as retry:
             raise ValueError(f'两种经校验的表面策略均被 TetGen 拒绝：{exc}；{retry}') from retry
@@ -109,7 +109,7 @@ def tetra_mesh(path,pitch,snap_tolerance=1e-4,max_elements=600000,surface_remesh
         snap_tolerance_mm=snap_tolerance,snapped_volume_relative_change=float(relative_change),surface_faces=len(surface.faces),
         source_closed_before_snap=source_closed,surface_conditioning=remesh_info,tetgen_attempts=attempts,
         max_volume_target_mm3=pitch**3/6,max_volume_actual_mm3=float(volumes.max()),
-        tetgen_switches=TETGEN_SWITCHES,quality_refinement=True,boundary_refinement=True,
+        tetgen_switches=TETGEN_SWITCHES,tetgen_quiet=False,quality_refinement=True,boundary_refinement=True,
         volume_p95_mm3=float(np.percentile(volumes,95)),volume_weighted_p95_mm3=weighted_p95,
         quality_min=float(quality.min()),quality_p01=float(np.percentile(quality,1)),
         low_quality_fraction=float(np.mean(quality<.01)),cavities=len(holes),

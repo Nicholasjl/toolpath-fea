@@ -31,11 +31,42 @@
           "items": {
             "$ref": "#/$defs/vector"
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "boxes"
+          ],
+          "properties": {
+            "boxes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {
+                  "$ref": "#/$defs/vector"
+                }
+              }
+            }
+          }
         }
       ]
     }
   },
   "properties": {
+    "tetwild_mode": {
+      "enum": ["modern", "legacy", "fast"],
+      "default": "modern"
+    },
+    "mesh_cache_dir": {
+      "type": "string",
+      "default": "",
+      "description": "Optional local content-addressed volume mesh cache; relative to case file."
+    },
     "mesh_mode": {
       "enum": [
         "voxel",
@@ -189,6 +220,21 @@
       "maximum": 5,
       "default": 0,
       "description": "Opt-in analysis surface conditioning target edge in mm; fixed 0.015 mm sampled deviation limit; 0 disables."
+    },
+    "tetra_backend": {
+      "enum": [
+        "tetgen",
+        "tetwild"
+      ],
+      "default": "tetgen",
+      "description": "Explicit TetWild opt-in requires requirements-robust.txt; never silently switches mesher."
+    },
+    "surface_tolerance_mm": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 0.015,
+      "default": 0.005,
+      "description": "TetWild surface envelope in mm; independent topology, volume and distance audits remain mandatory."
     }
   }
 }
