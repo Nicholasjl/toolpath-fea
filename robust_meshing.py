@@ -44,8 +44,13 @@ def surface_audit(source,nodes,cells,tolerance,samples=8192):
                 tolerance_mm=tolerance,hausdorff_verified=False,euler_number=int(output.euler_number),cavities=int(sum(x.volume<0 for x in before)))
 
 
-def tetra_mesh_robust(path,pitch,snap_tolerance=.0001,surface_tolerance_mm=.005,max_elements=600000,mode='modern'):
+def tetra_mesh_robust(path,pitch,snap_tolerance=.0001,surface_tolerance_mm=.005,max_elements=600000,mode='modern',stop_energy=None,max_iterations=80,quality_policy='target'):
     import trimesh
+    if quality_policy not in ('target','measured'):raise ValueError('quality_policy must be target/measured')
+    if quality_policy=='measured' and mode!='fast':raise ValueError('measured quality policy currently requires fast backend')
+    target=(100 if mode=='legacy' else 10) if stop_energy is None else stop_energy
+    if isinstance(target,bool) or not np.isfinite(target) or not 10<=target<=100:raise ValueError('TetWild stop_energy must be in [10,100]')
+    if isinstance(max_iterations,bool) or not isinstance(max_iterations,int) or not 1<=max_iterations<=200:raise ValueError('TetWild max_iterations must be in [1,200]')
     if mode not in ('modern','legacy','fast'):raise ValueError('TetWild mode must be modern/legacy/fast')
     if not np.isfinite(pitch) or pitch<=0:raise ValueError('pitch 必须为正有限数')
     if not np.isfinite(surface_tolerance_mm) or not 0<surface_tolerance_mm<=.015:raise ValueError('表面包络范围为 (0,0.015] mm')
@@ -74,16 +79,16 @@ def tetra_mesh_robust(path,pitch,snap_tolerance=.0001,surface_tolerance_mm=.005,
     if check.current_mesh().face_selection_array().any():raise ValueError('输入表面相交，拒绝静默修复')
     diagonal=float(np.linalg.norm(surface.extents))
     opts=dict(input=['surface'],filter='tracked',eps_rel=envelope/diagonal,length_rel=pitch/diagonal,
-              stop_energy=10,num_threads=4,preserve_topology=True,max_iterations=80,throw_on_fail=True,write_vtu=False)
+              stop_energy=target,num_threads=4,preserve_topology=True,max_iterations=max_iterations,throw_on_fail=True,write_vtu=False)
     if mode=='legacy':
         # The legacy tracked-surface writeback loses cavity-component orientation.
         # Use input winding for negative shells and audit the resulting boundary.
-        opts.update(stop_energy=100,skip_simplify=True,use_sample_envelope=True,use_legacy_code=True,
+        opts.update(skip_simplify=True,use_sample_envelope=True,use_legacy_code=True,
                     filter='input' if any(p.volume<0 for p in parts) else 'tracked')
     if mode=='fast':
         import pytetwild
         opts=dict(edge_length_abs=pitch,epsilon=envelope/diagonal,optimize=True,simplify=False,
-                  coarsen=False,stop_energy=10,num_opt_iter=80,num_threads=4,loglevel=2,quiet=False)
+                  coarsen=False,stop_energy=target,num_opt_iter=max_iterations,num_threads=4,loglevel=2,quiet=False)
         try:nodes,cells=pytetwild.tetrahedralize(np.asarray(surface.vertices),np.asarray(surface.faces,dtype=np.int32),**opts)
         except RuntimeError as exc:raise ValueError(f'fTetWild 生成失败：{exc}') from exc
         nodes=np.asarray(nodes,dtype=float);cells=np.asarray(cells,dtype=np.int32);report={}
@@ -102,8 +107,11 @@ def tetra_mesh_robust(path,pitch,snap_tolerance=.0001,surface_tolerance_mm=.005,
     lengths=sum(np.sum((xyz[:,a]-xyz[:,b])**2,axis=1) for a in range(4) for b in range(a))
     quality=12*(3*volumes)**(2/3)/lengths
     if mode=='fast':report=dict(max_energy=float(3/quality.min()),measurement='independent_3_over_mean_ratio',all_rounded=True)
-    if not report.get('all_rounded') or report.get('max_energy',float('inf'))>opts['stop_energy']*1.00001:
-        raise ValueError('TetWild 未达到质量优化目标')
+    target_met=bool(report.get('all_rounded') and report.get('max_energy',float('inf'))<=opts['stop_energy']*1.00001)
+    if quality_policy=='target' and not target_met:raise ValueError('TetWild 未达到质量优化目标')
+    if quality_policy=='measured' and (quality.min()<.001 or np.mean(quality<.01)>.001):
+        raise ValueError('TetWild 实测质量未达标：minimum >= 0.001, fraction below 0.01 <= 0.001')
+    report.update(optimization_target_met=target_met,quality_policy=quality_policy)
     audit=surface_audit(source if source_closed else surface,nodes,cells,surface_tolerance_mm)
     audit['reference']='original_cleaned_surface' if source_closed else 'snapped_closed_surface'
     audit['snap_displacement_bound_mm']=snap_displacement_bound

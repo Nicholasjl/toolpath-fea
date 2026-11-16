@@ -58,6 +58,9 @@
     }
   },
   "properties": {
+    "tetwild_quality_policy": {"type":"string", "enum":["target","measured"], "default":"target"},
+    "tetwild_stop_energy": {"type":["number","null"], "minimum":10, "maximum":100, "default":null},
+    "tetwild_max_iterations": {"type":"integer", "minimum":1, "maximum":200, "default":80},
     "max_elements": {"type":"integer", "minimum":1, "maximum":5000000, "default":600000},
     "tetgen_radius_edge": {"type":"number", "minimum":1.2, "maximum":3, "default":1.4},
     "tetwild_mode": {

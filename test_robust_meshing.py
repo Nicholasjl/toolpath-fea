@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import numpy as np
 import trimesh
 from agent_worker import validate_case,JobError
@@ -15,6 +16,9 @@ class RobustSettingsTests(unittest.TestCase):
         self.assertEqual(validate_case({},'.')['tetra_backend'],'tetgen')
         for cfg in [{'tetra_backend':'bad'},{'tetra_backend':'tetwild'},{'surface_tolerance_mm':0},{'surface_tolerance_mm':True},{'surface_tolerance_mm':.02}]:
             with self.assertRaises(JobError):validate_case(cfg,'.')
+        for cfg in [{'tetwild_stop_energy':True},{'tetwild_stop_energy':9},{'tetwild_stop_energy':101},{'tetwild_max_iterations':0},{'tetwild_max_iterations':201}]:
+            with self.assertRaises(JobError):validate_case(cfg,'.')
+        self.assertIsNone(validate_case({},'.')['tetwild_stop_energy'])
 
     def test_surface_audit_rejects_filled_through_hole(self):
         source=trimesh.creation.annulus(r_min=1,r_max=3,height=1)
@@ -64,6 +68,39 @@ class RobustMeshingTests(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec('pytetwild') and importlib.util.find_spec('pyvista'),'optional fast backend missing')
     def test_fast_refinement_improves_cantilever_bending(self):
         self.check_cantilever_bending('fast')
+
+    @unittest.skipUnless(importlib.util.find_spec('pytetwild') and importlib.util.find_spec('pyvista'),'optional fast backend missing')
+    def test_explicit_fast_optimization_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'box.stl';trimesh.creation.box(extents=[6,4,2]).export(p)
+            n,c,info=tetra_mesh_robust(p,2,mode='fast',stop_energy=30,max_iterations=4)
+        self.assertEqual(info['backend_options']['stop_energy'],30)
+        self.assertEqual(info['backend_options']['num_opt_iter'],4)
+        self.assertLessEqual(info['backend_report']['max_energy'],30.0003)
+        self.assertTrue(info['surface_conditioning']['topology_preserved'])
+
+    @unittest.skipUnless(importlib.util.find_spec('pytetwild') and importlib.util.find_spec('pyvista'),'optional fast backend missing')
+    def test_iteration_limit_does_not_bypass_quality(self):
+        nodes=np.array([[0,0,0],[100,0,0],[0,100,0],[0,0,.0048]])
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'box.stl';trimesh.creation.box(extents=[2,2,2]).export(p)
+            with patch('pytetwild.tetrahedralize',return_value=(nodes,np.array([[0,1,2,3]]))):
+                with self.assertRaisesRegex(ValueError,'质量优化目标'):
+                    tetra_mesh_robust(p,2,mode='fast',stop_energy=30,max_iterations=1)
+                with self.assertRaisesRegex(ValueError,'实测质量未达标'):
+                    tetra_mesh_robust(p,2,mode='fast',stop_energy=30,max_iterations=1,quality_policy='measured')
+
+    @unittest.skipUnless(importlib.util.find_spec('pytetwild') and importlib.util.find_spec('pyvista'),'optional fast backend missing')
+    def test_measured_policy_retains_unmet_target_flag(self):
+        nodes=np.array([[0,0,0],[3,0,0],[0,3,0],[0,0,.15]])
+        source=trimesh.convex.convex_hull(nodes)
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'thin.stl';source.export(p,file_type='stl_ascii')
+            with patch('pytetwild.tetrahedralize',return_value=(nodes,np.array([[0,1,2,3]]))):
+                n,c,info=tetra_mesh_robust(p,2,mode='fast',quality_policy='measured')
+        self.assertFalse(info['backend_report']['optimization_target_met'])
+        self.assertGreaterEqual(info['quality_min'],.001)
+        self.assertTrue(info['surface_conditioning']['topology_preserved'])
 
     def check_cantilever_bending(self,mode):
         E=2000.;nu=.3;G=E/(2*(1+nu));material=Material(E,E,E,G,G,G,nu,nu,nu)

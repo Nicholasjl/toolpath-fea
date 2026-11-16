@@ -4,10 +4,21 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import numpy as np
-from mesh_cache import cached_mesh
+from mesh_cache import cached_mesh,signature
 
 
 class MeshCacheTests(unittest.TestCase):
+    def test_numeric_equivalence_and_quality_policy_identity(self):
+        from agent_worker import validate_case
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'part.stl';p.write_text('signature-only fixture')
+            case=validate_case({'stl':str(p),'pitch':2},folder)
+            a=signature(case);case['pitch']=2.0
+            self.assertEqual(a,signature(case))
+            case['max_elements']+=1
+            self.assertNotEqual(a,signature(case))
+            a=signature(case);case['tetwild_quality_policy']='measured'
+            self.assertNotEqual(a,signature(case))
     def test_reuse_invalidation_and_corruption(self):
         with tempfile.TemporaryDirectory() as folder:
             case={'stl':'part.stl','mesh_mode':'tetra','mesh_cache_dir':folder}
