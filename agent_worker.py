@@ -22,18 +22,19 @@ def validate_case(cfg,base):
     if not isinstance(cfg,dict):raise JobError('INVALID_CASE','工况必须为 JSON 对象')
     allowed={'stl','size','pitch','gcode','offset','angle','build_axis','material','fixed','loaded','force',
              'mesh_mode','snap_tolerance','solver','rtol','maxiter','chunk_size','load_point','surface_remesh_mm',
-             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode'}
+             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode','tetgen_radius_edge'}
     if set(cfg)-allowed:raise JobError('INVALID_CASE',f'未知工况字段：{sorted(set(cfg)-allowed)}')
     cfg={'stl':'','size':[40,12,8],'pitch':DEFAULT_PITCH_MM,'gcode':'','offset':[0,0,0],'angle':0,
          'build_axis':'Z','material':{},'fixed':'X-','loaded':'X+','force':[0,0,-10],
          'mesh_mode':DEFAULT_MESH_MODE,'snap_tolerance':.0001,'surface_remesh_mm':0,'solver':'auto','rtol':1e-9,'maxiter':2000,'chunk_size':4096,
-         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'',**cfg}
+         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'','tetgen_radius_edge':1.4,**cfg}
     def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
     for key in ('pitch','angle'):
         if not number(cfg[key]):raise JobError('INVALID_CASE',f'{key} 必须为有限数值')
     if cfg['pitch']<=0:raise JobError('INVALID_CASE','pitch 必须大于零')
     if cfg['mesh_mode'] not in ('voxel','tetra'):raise JobError('INVALID_CASE','mesh_mode 必须为 voxel/tetra')
     if cfg['tetra_backend'] not in ('tetgen','tetwild'):raise JobError('INVALID_CASE','tetra_backend 必须为 tetgen/tetwild')
+    if not number(cfg['tetgen_radius_edge']) or not 1.2<=cfg['tetgen_radius_edge']<=3:raise JobError('INVALID_CASE','tetgen_radius_edge 范围为 1.2–3')
     if cfg['tetwild_mode'] not in ('modern','legacy','fast'):raise JobError('INVALID_CASE','tetwild_mode 必须为 modern/legacy/fast')
     if not number(cfg['surface_tolerance_mm']) or not 0<cfg['surface_tolerance_mm']<=.015:raise JobError('INVALID_CASE','surface_tolerance_mm 范围为 (0,0.015] mm')
     if cfg['tetra_backend']=='tetwild' and (cfg['mesh_mode']!='tetra' or not cfg['stl'] or cfg['surface_remesh_mm']):
@@ -235,7 +236,7 @@ def worker_main(queue,cfg,base,directory,options):
         mesh_cache={}
         def compute(case,label):
             emit(label+'.mesh')
-            key=(case['stl'],case['pitch'],case['mesh_mode'],case['snap_tolerance'],case['surface_remesh_mm'],case['tetra_backend'],case['surface_tolerance_mm'],case['tetwild_mode'])
+            key=(case['stl'],case['pitch'],case['mesh_mode'],case['snap_tolerance'],case['surface_remesh_mm'],case['tetra_backend'],case['surface_tolerance_mm'],case['tetwild_mode'],case['tetgen_radius_edge'])
             if key not in mesh_cache:
                 if case['stl'] and case['mesh_mode']=='tetra':
                     from mesh_cache import cached_mesh
@@ -244,7 +245,7 @@ def worker_main(queue,cfg,base,directory,options):
                         mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh_robust(case['stl'],case['pitch'],case['snap_tolerance'],case['surface_tolerance_mm'],mode=case['tetwild_mode']))
                     else:
                         from meshing import tetra_mesh
-                        mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh(case['stl'],case['pitch'],case['snap_tolerance'],surface_remesh_mm=case['surface_remesh_mm']))
+                        mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh(case['stl'],case['pitch'],case['snap_tolerance'],surface_remesh_mm=case['surface_remesh_mm'],radius_edge=case['tetgen_radius_edge']))
                 else:
                     n,c=stl_mesh(case['stl'],case['pitch']) if case['stl'] else box_mesh(case['size'],case['pitch'])
                     mesh_cache[key]=(n,c,{'mode':'voxel'})

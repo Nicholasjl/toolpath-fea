@@ -150,4 +150,8 @@ Conditioning changes the analysis surface and does not prove local stress conver
 
 Identical node and cell arrays across two nominal pitches now yield `MESH_CONVERGENCE=not_checked`, never `pass`. This guards against false convergence when boundary preservation blocks interior refinement.
 
+`tetgen_radius_edge` explicitly controls TetGen's radius-edge refinement target (1.2–3, default 1.4). The actual mean-ratio quality and mesh convergence remain separately checked; a larger value is not an accuracy guarantee. The value is included in mesh-cache signatures. After numerical flat-cell removal, TetGen now independently audits the reconstructed boundary for closure, winding, topology and sampled distance to its prepared PLC surface. Negligible removed volume alone is insufficient: nonmanifold pinches are rejected before solving. The boundary audit uses 1e-6 mm sampled distance because TetGen conforms to that prepared surface; any preparation error is reported separately.
+
+The linear solver releases redundant sparse matrices before AMG setup and uses the retained original global stiffness matrix to check the unscaled free-DOF residual. This reduces peak memory without changing the equilibrium criterion.
+
 S1B1H regression: the previous unconditional smoothing introduced four intersecting faces near an installation pad despite preserving watertightness, Euler number and volume. The no-smoothing candidate has zero detected intersections and solves successfully. S1B1W uses the separately checked smoothing fallback. This is a bounded geometry-conditioning workflow, not general self-intersection repair; existing intersecting inputs are rejected.

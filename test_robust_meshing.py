@@ -21,6 +21,12 @@ class RobustSettingsTests(unittest.TestCase):
         n,c=box_mesh((6,6,1),1);n-=np.array([3,3,.5])
         with self.assertRaisesRegex(ValueError,'拓扑'):surface_audit(source,n,c,.005,256)
 
+    def test_boundary_pinched_at_an_edge_is_rejected(self):
+        n=np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],[0,-1,0],[0,0,-1]],dtype=float)
+        c=np.array([[0,1,2,3],[0,1,4,5]])
+        with self.assertRaisesRegex(ValueError,'未闭合'):
+            surface_audit(trimesh.creation.box(),n,c,.005,256)
+
 
 @unittest.skipUnless(importlib.util.find_spec('wildmeshing'),'optional requirements-robust.txt not installed')
 class RobustMeshingTests(unittest.TestCase):

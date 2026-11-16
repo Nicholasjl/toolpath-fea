@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 import numpy as np
 import trimesh
-from agent_worker import validate_case, convergence_check
+from agent_worker import validate_case, convergence_check, JobError
 from defaults import DEFAULT_MESH_MODE, DEFAULT_PITCH_MM, TETGEN_SWITCHES
 from meshing import tetra_mesh, volume_resolution
 from solid import Material, solve_solid
@@ -51,6 +51,17 @@ class MeshDefaultTests(unittest.TestCase):
         self.assertEqual(convergence_check(base,fine,.001,.001,[0,-1,0])['status'],'not_checked')
         fine['mesh_info'].pop('volume_weighted_p95_mm3')
         self.assertEqual(convergence_check(base,fine,.001,.001,[0,-1,0])['status'],'not_checked')
+
+    def test_explicit_quality_ratio_and_boundary_audit(self):
+        self.assertEqual(validate_case({},Path('.'))['tetgen_radius_edge'],1.4)
+        for bad in [True,1.1,3.1,float('nan')]:
+            with self.assertRaises(JobError):
+                validate_case({'tetgen_radius_edge':bad},Path('.'))
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'box.stl';trimesh.creation.box(extents=[5,4,3]).export(p)
+            n,c,info=tetra_mesh(p,2,radius_edge=2)
+            self.assertEqual(info['tetgen_switches'],'pq2Q')
+            self.assertTrue(info['boundary_audit']['topology_preserved'])
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
