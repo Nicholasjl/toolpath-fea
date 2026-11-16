@@ -9,7 +9,7 @@ import numpy as np
 
 
 def signature(case):
-    keys=('pitch','mesh_mode','snap_tolerance','surface_remesh_mm','tetra_backend','surface_tolerance_mm','tetwild_mode','tetgen_radius_edge')
+    keys=('pitch','mesh_mode','snap_tolerance','surface_remesh_mm','tetra_backend','surface_tolerance_mm','tetwild_mode','tetgen_radius_edge','max_elements')
     digest=hashlib.sha256(json.dumps({k:case[k] for k in keys},sort_keys=True).encode())
     for path in [Path(case['stl'])]+[Path(__file__).with_name(x) for x in ('meshing.py','robust_meshing.py','solid.py','mesh_cache.py')]:
         digest.update(path.read_bytes())

@@ -58,6 +58,7 @@
     }
   },
   "properties": {
+    "max_elements": {"type":"integer", "minimum":1, "maximum":5000000, "default":600000},
     "tetgen_radius_edge": {"type":"number", "minimum":1.2, "maximum":3, "default":1.4},
     "tetwild_mode": {
       "enum": ["modern", "legacy", "fast"],

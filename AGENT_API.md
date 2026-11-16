@@ -154,4 +154,6 @@ Identical node and cell arrays across two nominal pitches now yield `MESH_CONVER
 
 The linear solver releases redundant sparse matrices before AMG setup and uses the retained original global stiffness matrix to check the unscaled free-DOF residual. This reduces peak memory without changing the equilibrium criterion.
 
+For explicitly budgeted large tetrahedral jobs, `max_elements` may be set from 1 to 5,000,000 (default 600,000). It is checked for both tetrahedral backends and included in the mesh-cache key. This limits accepted output size, not the native mesher's temporary memory; retain an appropriate CLI timeout and RSS budget. Connectivity scratch arrays are released before stiffness assembly.
+
 S1B1H regression: the previous unconditional smoothing introduced four intersecting faces near an installation pad despite preserving watertightness, Euler number and volume. The no-smoothing candidate has zero detected intersections and solves successfully. S1B1W uses the separately checked smoothing fallback. This is a bounded geometry-conditioning workflow, not general self-intersection repair; existing intersecting inputs are rejected.

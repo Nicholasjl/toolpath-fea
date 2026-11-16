@@ -22,12 +22,12 @@ def validate_case(cfg,base):
     if not isinstance(cfg,dict):raise JobError('INVALID_CASE','工况必须为 JSON 对象')
     allowed={'stl','size','pitch','gcode','offset','angle','build_axis','material','fixed','loaded','force',
              'mesh_mode','snap_tolerance','solver','rtol','maxiter','chunk_size','load_point','surface_remesh_mm',
-             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode','tetgen_radius_edge'}
+             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode','tetgen_radius_edge','max_elements'}
     if set(cfg)-allowed:raise JobError('INVALID_CASE',f'未知工况字段：{sorted(set(cfg)-allowed)}')
     cfg={'stl':'','size':[40,12,8],'pitch':DEFAULT_PITCH_MM,'gcode':'','offset':[0,0,0],'angle':0,
          'build_axis':'Z','material':{},'fixed':'X-','loaded':'X+','force':[0,0,-10],
          'mesh_mode':DEFAULT_MESH_MODE,'snap_tolerance':.0001,'surface_remesh_mm':0,'solver':'auto','rtol':1e-9,'maxiter':2000,'chunk_size':4096,
-         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'','tetgen_radius_edge':1.4,**cfg}
+         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'','tetgen_radius_edge':1.4,'max_elements':600000,**cfg}
     def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
     for key in ('pitch','angle'):
         if not number(cfg[key]):raise JobError('INVALID_CASE',f'{key} 必须为有限数值')
@@ -44,7 +44,7 @@ def validate_case(cfg,base):
     if not number(cfg['surface_remesh_mm']) or not 0<=cfg['surface_remesh_mm']<=5:raise JobError('INVALID_CASE','surface_remesh_mm 范围为 0–5 mm')
     if cfg['surface_remesh_mm'] and (cfg['mesh_mode']!='tetra' or not cfg['stl']):raise JobError('INVALID_CASE','表面重网格需要 STL 与 tetra 模式')
     if not number(cfg['rtol']) or not 0<cfg['rtol']<=1e-4:raise JobError('INVALID_CASE','rtol 范围为 (0,1e-4]')
-    for key,lo,hi in [('maxiter',1,10000),('chunk_size',128,16384)]:
+    for key,lo,hi in [('maxiter',1,10000),('chunk_size',128,16384),('max_elements',1,5000000)]:
         if not isinstance(cfg[key],int) or isinstance(cfg[key],bool) or not lo<=cfg[key]<=hi:raise JobError('INVALID_CASE',f'{key} 范围 {lo}–{hi}')
     for key in ('size','offset','force'):
         if not isinstance(cfg[key],list) or len(cfg[key])!=3 or not all(map(number,cfg[key])):
@@ -236,16 +236,16 @@ def worker_main(queue,cfg,base,directory,options):
         mesh_cache={}
         def compute(case,label):
             emit(label+'.mesh')
-            key=(case['stl'],case['pitch'],case['mesh_mode'],case['snap_tolerance'],case['surface_remesh_mm'],case['tetra_backend'],case['surface_tolerance_mm'],case['tetwild_mode'],case['tetgen_radius_edge'])
+            key=(case['stl'],case['pitch'],case['mesh_mode'],case['snap_tolerance'],case['surface_remesh_mm'],case['tetra_backend'],case['surface_tolerance_mm'],case['tetwild_mode'],case['tetgen_radius_edge'],case['max_elements'])
             if key not in mesh_cache:
                 if case['stl'] and case['mesh_mode']=='tetra':
                     from mesh_cache import cached_mesh
                     if case['tetra_backend']=='tetwild':
                         from robust_meshing import tetra_mesh_robust
-                        mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh_robust(case['stl'],case['pitch'],case['snap_tolerance'],case['surface_tolerance_mm'],mode=case['tetwild_mode']))
+                        mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh_robust(case['stl'],case['pitch'],case['snap_tolerance'],case['surface_tolerance_mm'],mode=case['tetwild_mode'],max_elements=case['max_elements']))
                     else:
                         from meshing import tetra_mesh
-                        mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh(case['stl'],case['pitch'],case['snap_tolerance'],surface_remesh_mm=case['surface_remesh_mm'],radius_edge=case['tetgen_radius_edge']))
+                        mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh(case['stl'],case['pitch'],case['snap_tolerance'],surface_remesh_mm=case['surface_remesh_mm'],radius_edge=case['tetgen_radius_edge'],max_elements=case['max_elements']))
                 else:
                     n,c=stl_mesh(case['stl'],case['pitch']) if case['stl'] else box_mesh(case['size'],case['pitch'])
                     mesh_cache[key]=(n,c,{'mode':'voxel'})

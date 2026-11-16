@@ -63,5 +63,14 @@ class MeshDefaultTests(unittest.TestCase):
             self.assertEqual(info['tetgen_switches'],'pq2Q')
             self.assertTrue(info['boundary_audit']['topology_preserved'])
 
+    def test_explicit_element_budget(self):
+        self.assertEqual(validate_case({},Path('.'))['max_elements'],600000)
+        for bad in [True,0,5000001,2.5]:
+            with self.assertRaises(JobError):validate_case({'max_elements':bad},Path('.'))
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'box.stl';trimesh.creation.box(extents=[5,4,3]).export(p)
+            with self.assertRaisesRegex(ValueError,'超出限制'):
+                tetra_mesh(p,2,max_elements=1)
+
 
 if __name__=='__main__':unittest.main(verbosity=2)
