@@ -58,6 +58,7 @@
     }
   },
   "properties": {
+    "refinement_strategy": {"type":"string", "enum":["independent","uniform"], "default":"independent"},
     "tetwild_quality_policy": {"type":"string", "enum":["target","measured"], "default":"target"},
     "tetwild_stop_energy": {"type":["number","null"], "minimum":10, "maximum":100, "default":null},
     "tetwild_max_iterations": {"type":"integer", "minimum":1, "maximum":200, "default":80},

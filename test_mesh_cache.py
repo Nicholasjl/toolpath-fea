@@ -19,6 +19,7 @@ class MeshCacheTests(unittest.TestCase):
             self.assertNotEqual(a,signature(case))
             a=signature(case);case['tetwild_quality_policy']='measured'
             self.assertNotEqual(a,signature(case))
+            self.assertNotEqual(signature(case),signature(case,'uniform:parent_digest'))
     def test_reuse_invalidation_and_corruption(self):
         with tempfile.TemporaryDirectory() as folder:
             case={'stl':'part.stl','mesh_mode':'tetra','mesh_cache_dir':folder}

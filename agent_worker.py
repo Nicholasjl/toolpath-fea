@@ -22,12 +22,12 @@ def validate_case(cfg,base):
     if not isinstance(cfg,dict):raise JobError('INVALID_CASE','工况必须为 JSON 对象')
     allowed={'stl','size','pitch','gcode','offset','angle','build_axis','material','fixed','loaded','force',
              'mesh_mode','snap_tolerance','solver','rtol','maxiter','chunk_size','load_point','surface_remesh_mm',
-             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode','tetgen_radius_edge','max_elements','tetwild_stop_energy','tetwild_max_iterations','tetwild_quality_policy'}
+             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode','tetgen_radius_edge','max_elements','tetwild_stop_energy','tetwild_max_iterations','tetwild_quality_policy','refinement_strategy'}
     if set(cfg)-allowed:raise JobError('INVALID_CASE',f'未知工况字段：{sorted(set(cfg)-allowed)}')
     cfg={'stl':'','size':[40,12,8],'pitch':DEFAULT_PITCH_MM,'gcode':'','offset':[0,0,0],'angle':0,
          'build_axis':'Z','material':{},'fixed':'X-','loaded':'X+','force':[0,0,-10],
          'mesh_mode':DEFAULT_MESH_MODE,'snap_tolerance':.0001,'surface_remesh_mm':0,'solver':'auto','rtol':1e-9,'maxiter':2000,'chunk_size':4096,
-         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'','tetgen_radius_edge':1.4,'max_elements':600000,'tetwild_stop_energy':None,'tetwild_max_iterations':80,'tetwild_quality_policy':'target',**cfg}
+         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'','tetgen_radius_edge':1.4,'max_elements':600000,'tetwild_stop_energy':None,'tetwild_max_iterations':80,'tetwild_quality_policy':'target','refinement_strategy':'independent',**cfg}
     def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
     for key in ('pitch','angle'):
         if not number(cfg[key]):raise JobError('INVALID_CASE',f'{key} 必须为有限数值')
@@ -42,6 +42,8 @@ def validate_case(cfg,base):
     if not number(cfg['surface_tolerance_mm']) or not 0<cfg['surface_tolerance_mm']<=.015:raise JobError('INVALID_CASE','surface_tolerance_mm 范围为 (0,0.015] mm')
     if cfg['tetra_backend']=='tetwild' and (cfg['mesh_mode']!='tetra' or not cfg['stl'] or cfg['surface_remesh_mm']):
         raise JobError('INVALID_CASE','TetWild 需要 STL、tetra 模式，且不能同时使用 surface_remesh_mm')
+    if cfg['refinement_strategy'] not in ('independent','uniform'):raise JobError('INVALID_CASE','refinement_strategy must be independent/uniform')
+    if cfg['refinement_strategy']=='uniform' and cfg['mesh_mode']!='tetra':raise JobError('INVALID_CASE','uniform refinement requires tetra mesh')
     if cfg['solver'] not in ('auto','direct','amg'):raise JobError('INVALID_CASE','solver 必须为 auto/direct/amg')
     if not number(cfg['snap_tolerance']) or not 0<=cfg['snap_tolerance']<=.01:raise JobError('INVALID_CASE','snap_tolerance 范围为 0–0.01 mm')
     if not number(cfg['surface_remesh_mm']) or not 0<=cfg['surface_remesh_mm']<=5:raise JobError('INVALID_CASE','surface_remesh_mm 范围为 0–5 mm')
@@ -240,11 +242,18 @@ def worker_main(queue,cfg,base,directory,options):
                 inputs[key]={'path':cfg[key],'sha256':digest.hexdigest()}
         emit('gcode_read');segments=read_gcode(cfg['gcode']) if cfg['gcode'] else None
         mesh_cache={}
-        def compute(case,label):
+        def compute(case,label,parent=None):
             emit(label+'.mesh')
             key=(case['stl'],case['pitch'],case['mesh_mode'],case['snap_tolerance'],case['surface_remesh_mm'],case['tetra_backend'],case['surface_tolerance_mm'],case['tetwild_mode'],case['tetgen_radius_edge'],case['max_elements'],case['tetwild_stop_energy'],case['tetwild_max_iterations'],case['tetwild_quality_policy'])
+            key+=(parent is not None,)
             if key not in mesh_cache:
-                if case['stl'] and case['mesh_mode']=='tetra':
+                if parent is not None:
+                    from refinement import refine_tetra
+                    from mesh_cache import cached_mesh
+                    digest=hashlib.sha256(parent['nodes'].tobytes());digest.update(parent['cells'].tobytes())
+                    digest.update(Path(__file__).with_name('refinement.py').read_bytes())
+                    mesh_cache[key]=cached_mesh(case,lambda:refine_tetra(parent['nodes'],parent['cells'],parent['mesh_info'],case['pitch'],case['max_elements']),variant='uniform:'+digest.hexdigest())
+                elif case['stl'] and case['mesh_mode']=='tetra':
                     from mesh_cache import cached_mesh
                     if case['tetra_backend']=='tetwild':
                         from robust_meshing import tetra_mesh_robust
@@ -270,9 +279,12 @@ def worker_main(queue,cfg,base,directory,options):
         r=compute(cfg,'base');emit('checks');checks=diagnostics(cfg,r,segments)
         runs=[dict(name='base',pitch=cfg['pitch'],angle=cfg['angle'],metrics=metrics(r))]
         if options['convergence']:
-            refined={**cfg,'pitch':cfg['pitch']/1.5}
+            uniform=cfg['refinement_strategy']=='uniform'
+            refined={**cfg,'pitch':cfg['pitch']/(2 if uniform else 1.5)}
             try:
-                fine=compute(refined,'refined');fm=metrics(fine);bm=runs[0]['metrics']
+                fine=compute(refined,'refined',r if uniform else None);fm=metrics(fine);bm=runs[0]['metrics']
+                for item in diagnostics(refined,fine,segments):
+                    checks.append({**item,'code':'REFINED_'+item['code']})
                 du=abs(fm['max_displacement_mm']-bm['max_displacement_mm'])/max(fm['max_displacement_mm'],1e-20)
                 ds=abs(fm['stress_p95_MPa']-bm['stress_p95_MPa'])/max(fm['stress_p95_MPa'],1e-20)
                 checks.append(convergence_check(r,fine,du,ds,cfg['force']))
@@ -293,7 +305,7 @@ def worker_main(queue,cfg,base,directory,options):
                 runs.append(dict(name=f'angle_{i}',pitch=case['pitch'],angle=angle,metrics=metrics(result)))
                 write_npz(out/f'angle_{i}.npz',result);del result
         emit('export');write_vtk(out/'result.vtk',r);write_npz(out/'result.npz',r)
-        summary=dict(settings=cfg,inputs=inputs,units='mm,N,MPa',metrics=metrics(r),checks=checks,checks_scope='base_case_only',runs=runs,
+        summary=dict(settings=cfg,inputs=inputs,units='mm,N,MPa',metrics=metrics(r),checks=checks,checks_scope='base_and_available_refined_cases',runs=runs,
                      quality='needs_review' if any(c['status'] in ('warn','not_checked') for c in checks) else 'numerical_checks_passed',scope='numerical_screening_only')
         emit('render');render(r,out/'preview.png');write_report(out/'report.html',summary)
         (out/'analysis.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')

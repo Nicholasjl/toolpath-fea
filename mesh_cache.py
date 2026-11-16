@@ -8,13 +8,14 @@ import uuid
 import numpy as np
 
 
-def signature(case):
+def signature(case,variant=None):
     keys=('pitch','mesh_mode','snap_tolerance','surface_remesh_mm','tetra_backend','surface_tolerance_mm','tetwild_mode','tetgen_radius_edge','max_elements','tetwild_stop_energy','tetwild_max_iterations','tetwild_quality_policy')
     values={k:case[k] for k in keys}
     # JSON's 2 and 2.0 describe the same mesh request.
     for k in ('pitch','snap_tolerance','surface_remesh_mm','surface_tolerance_mm','tetgen_radius_edge','tetwild_stop_energy'):
         if values[k] is not None:values[k]=float(values[k])
     digest=hashlib.sha256(json.dumps(values,sort_keys=True).encode())
+    if variant is not None:digest.update(('mesh_variant:'+variant).encode())
     for path in [Path(case['stl'])]+[Path(__file__).with_name(x) for x in ('meshing.py','robust_meshing.py','solid.py','mesh_cache.py')]:
         digest.update(path.read_bytes())
     optional=(('pytetwild',) if case['tetwild_mode']=='fast' else ('wildmeshing',)) if case['tetra_backend']=='tetwild' else ()
@@ -27,10 +28,11 @@ def checksum(nodes,cells,info):
     h=hashlib.sha256(nodes.tobytes());h.update(cells.tobytes());h.update(info.encode());return h.hexdigest()
 
 
-def cached_mesh(case,generate):
+def cached_mesh(case,generate,variant=None):
     folder=case.get('mesh_cache_dir')
     if not folder or not case['stl'] or case['mesh_mode']!='tetra':return generate()
-    key=signature(case);folder=Path(folder);folder.mkdir(parents=True,exist_ok=True);path=folder/(key+'.npz')
+    key=signature(case) if variant is None else signature(case,variant)
+    folder=Path(folder);folder.mkdir(parents=True,exist_ok=True);path=folder/(key+'.npz')
     if path.exists():
         try:
             with np.load(path,allow_pickle=False) as data:
