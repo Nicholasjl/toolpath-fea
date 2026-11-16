@@ -1,0 +1,4 @@
+-r requirements.txt
+wildmeshing>=2.0.0,<3
+pytetwild==0.4.2
+pyvista>=0.49,<0.50

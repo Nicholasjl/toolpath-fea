@@ -1,5 +1,39 @@
 # Agent 调用协议 v1.0
 
+## 稳健贴体网格和分离安装区（2026-11-16）
+
+安装可选后端：`python -m pip install -r requirements-robust.txt`。
+显式设置 `tetra_backend: "tetwild"` 使用 TetWild；默认仍为 TetGen。
+只支持 STL 的 tetra 模式，不能与 `surface_remesh_mm` 同时启用。
+`surface_tolerance_mm` 默认 0.005 mm，范围 (0, 0.015] mm；这是分析副本的几何变化预算。
+坐标量化的最大位移先从预算扣除。原模型不改写。
+拒绝相交输入，检查闭合性、分量 Euler 数、封闭空腔数量、体积误差不超过 0.2%，
+并独立进行每方向 8192 点的确定性表面距离抽样。抽样不构成 Hausdorff 证明，也不证明每个孔的局部形状精度。
+`tetwild_mode: "modern"`（默认）使用精确包络和 AMIPS 最大能量 10 的优化目标。
+显式 `"legacy"` 使用原优化内核、抽样包络和其标准能量目标 100，并跳过耗时的输入简化；
+适合对照诊断现代内核在近退化表面上的停滞。两种模式都必须达到各自质量目标、成功舍入，
+并通过相同的独立几何审计。抽样包络不提供全表面的严格误差保证。
+能量目标不同不代表结果可直接比较；仍需实际网格细化、残差、平衡和局部应力校核。
+`tetwild_mode: "fast"` 使用 fTetWild 浮点插入与优化（PyTetWild），跳过输入简化，
+通过独立计算 `3 / mean_ratio` 检查最大 AMIPS 能量不超过 10；几何审计保持相同。
+PyTetWild 0.4.2 的导入仍需要 PyVista，已在可选依赖文件中显式列出；调用不需要显示窗口。
+TetGen 的原生诊断输出现在保留在 `native.log`；每个 CLI 子进程在独立运行目录工作，
+避免原生库的固定名称诊断文件互相覆盖。
+`pitch` 控制目标边长，报告仍用 `pitch³/6` 审计实际体积尺寸；不能仅凭请求尺寸认定细化成功。
+
+`fixed` 和 `loaded` 现在还接受 `{"boxes": [[[xmin,ymin,zmin],[xmax,ymax,zmax]], ...]}`，
+表示 1–64 个区域的并集。每个区域必须选中面，否则拒绝；重叠面仅计一次。
+每个子区域分别报告面数、面积及范围，便于核对四个安装孔；约束仍是所有位移固定。
+
+可选 `mesh_cache_dir: "cache"` 按工况目录解析。缓存键包含 STL 内容、所有网格参数、
+网格实现源码和依赖版本；不包含载荷/材料，因此相同几何可复用于多个工况。
+缓存只在网格审计完成后原子写入，读取无需 pickle，校验数组和元数据哈希；坏缓存重新生成。
+缓存来自本地可信目录，不能代替输入可信度检查。源码或网格参数变化自动失效。
+
+指标增加应变能 `strain_energy_Nmm`、功共轭位移 `work_conjugate_displacement_mm=2U/|F|`、
+柔度 `compliance_mm_per_N=2U/|F|²`。偏置工况的功共轭位移包含等效力矩做功，
+不能当作某个实体节点的位移；全板最大节点位移仍单独报告。
+
 入口 `run3d.py`，无需桌面或显示服务器。安装依赖：`python -m pip install -r requirements.txt`。输入模板 `example_case.json`，字段契约 `case.schema.json`。原桌面入口保持不变。
 
 ## 薄壁与大模型选项（2026-11-07）
@@ -115,5 +149,17 @@ Configured coordinate snapping now precedes the final closed-surface acceptance;
 Conditioning changes the analysis surface and does not prove local stress convergence. Compare independently refined surfaces for critical thin-wall bending.
 
 Identical node and cell arrays across two nominal pitches now yield `MESH_CONVERGENCE=not_checked`, never `pass`. This guards against false convergence when boundary preservation blocks interior refinement.
+
+`tetgen_radius_edge` explicitly controls TetGen's radius-edge refinement target (1.2–3, default 1.4). The actual mean-ratio quality and mesh convergence remain separately checked; a larger value is not an accuracy guarantee. The value is included in mesh-cache signatures. After numerical flat-cell removal, TetGen now independently audits the reconstructed boundary for closure, winding, topology and sampled distance to its prepared PLC surface. Negligible removed volume alone is insufficient: nonmanifold pinches are rejected before solving. The boundary audit uses 1e-6 mm sampled distance because TetGen conforms to that prepared surface; any preparation error is reported separately.
+
+The linear solver releases redundant sparse matrices before AMG setup and uses the retained original global stiffness matrix to check the unscaled free-DOF residual. This reduces peak memory without changing the equilibrium criterion.
+
+For explicitly budgeted large tetrahedral jobs, `max_elements` may be set from 1 to 5,000,000 (default 600,000). It is checked for both tetrahedral backends and included in the mesh-cache key. This limits accepted output size, not the native mesher's temporary memory; retain an appropriate CLI timeout and RSS budget. Connectivity scratch arrays are released before stiffness assembly.
+
+`tetwild_stop_energy` optionally selects an optimization target from 10 to 100; null preserves the existing defaults (10 for modern/fast, 100 for legacy). `tetwild_max_iterations` limits optimization to 1–200 iterations (default 80). Both are recorded and included in cache keys. Exhausting an iteration budget does not accept a poor mesh: the measured output energy must still meet the requested target, followed by the same topology, geometry and volume audits. For fTetWild, energy is independently computed as 3 / minimum tetrahedral mean-ratio quality. These are mesh-generation controls, not structural error tolerances; displacement and regional-stress refinement remain necessary.
+
+The default `tetwild_quality_policy: target` requires the optimization target above. An explicit `measured` policy for the fast backend instead requires minimum mean-ratio quality >= 0.001 and a fraction below 0.01 <= 0.001, while retaining all geometry/topology/volume checks. This permits numerical screening of an incompletely optimized mesh; `MESHER_OPTIMIZATION` remains a warning if its target was not met. It never reports that target as achieved, and does not establish structural accuracy or convergence. Linear residuals, equilibrium and actual mesh refinement must still be checked. Cache keys distinguish these policies and normalize equivalent numeric JSON values (2 and 2.0).
+
+`refinement_strategy: uniform` optionally subdivides each accepted tetrahedron into eight conforming children for the convergence run; the default remains independent remeshing at pitch / 1.5. Uniform refinement uses pitch / 2, globally shared edge midpoints and a quality-selected interior octahedron diagonal. It preserves the parent's linear boundary exactly, verifies each parent's volume, boundary closure/Euler characteristic and measured child quality, and enforces the same output element budget. The refined cache is separated from native meshes by a parent-node/cell and refinement-code digest. This costs eight times the accepted parent cell count and does not guarantee convergence. Both base and refined runs now receive geometry, equilibrium, region, path and quality diagnostics; refined check codes begin with `REFINED_`.
 
 S1B1H regression: the previous unconditional smoothing introduced four intersecting faces near an installation pad despite preserving watertightness, Euler number and volume. The no-smoothing candidate has zero detected intersections and solves successfully. S1B1W uses the separately checked smoothing fallback. This is a bounded geometry-conditioning workflow, not general self-intersection repair; existing intersecting inputs are rejected.

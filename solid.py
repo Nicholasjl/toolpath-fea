@@ -102,6 +102,13 @@ def boundary_faces(cells):
 
 
 def select_faces(nodes,faces,region):
+    if isinstance(region,dict):
+        if set(region)!={'boxes'} or not isinstance(region['boxes'],list) or not region['boxes']:
+            raise ValueError('选区并集必须包含非空 boxes 列表')
+        masks=[select_faces(nodes,faces,box) for box in region['boxes']]
+        if any(not mask.any() for mask in masks):
+            raise ValueError('选区并集中的一个子区域没有选中表面；不能静默丢失安装点')
+        return np.logical_or.reduce(masks)
     centers=nodes[faces].mean(axis=1)
     if isinstance(region,str):
         axis='XYZ'.index(region[0]); edge=nodes[:,axis].min() if region[1]=='-' else nodes[:,axis].max()
@@ -177,6 +184,9 @@ def solve_solid(nodes,cells,material=None,fixed='X-',loaded='X+',force=(0,0,-10)
     graph=coo_matrix((np.ones(len(a)*2),(np.r_[a,b],np.r_[b,a])),shape=(len(cells),len(cells))).tocsr()
     if connected_components(graph,directed=False,return_labels=False)!=1:
         raise ValueError('网格有多个不连通实体或仅边角接触；请逐件分析或减小网格间距')
+    # Connectivity is checked once; do not retain its multi-million-face scratch
+    # arrays during assembly and AMG setup.
+    del all_faces,inv,counts,order,starts,shared,a,b,graph,_
     centers=nodes[cells].mean(axis=1)
     angles=np.full(len(cells),np.deg2rad(angle)); distances=np.zeros(len(cells))
     if segments is not None:

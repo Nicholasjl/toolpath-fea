@@ -71,6 +71,8 @@ def solve_linear(K,f,nodes,free,method='auto',rtol=1e-9,maxiter=2000,progress=No
     if np.linalg.norm(rhs)==0:return np.zeros(len(free)),{**stats,'seconds':time.perf_counter()-started,'relative_residual':0.}
     # Equilibrate both direct and iterative solves to improve thin-section conditioning.
     scale=1/np.sqrt(A.diagonal());S=diags(scale);scaled=(S@A@S).tocsr();b=scale*rhs
+    # K is retained for reactions; avoid retaining a second unscaled free matrix.
+    del A,S
     if method=='direct':
         with warnings.catch_warnings():
             warnings.simplefilter('error',MatrixRankWarning);y=spsolve(scaled,b)
@@ -79,8 +81,8 @@ def solve_linear(K,f,nodes,free,method='auto',rtol=1e-9,maxiter=2000,progress=No
         candidates=rigid_modes(nodes)[free]/scale[:,None]
         if progress:progress('amg_setup')
         # All boundary conditions clamp complete nodes, preserving three-DOF blocks.
-        block=scaled.tobsr(blocksize=(3,3))
-        hierarchy=pyamg.smoothed_aggregation_solver(block,B=candidates,symmetry='symmetric',
+        scaled=scaled.tobsr(blocksize=(3,3))
+        hierarchy=pyamg.smoothed_aggregation_solver(scaled,B=candidates,symmetry='symmetric',
                     smooth='energy',max_coarse=120)
         stats['amg_levels']=len(hierarchy.levels);stats['operator_complexity']=float(hierarchy.operator_complexity())
         def callback(_):
@@ -88,7 +90,9 @@ def solve_linear(K,f,nodes,free,method='auto',rtol=1e-9,maxiter=2000,progress=No
             if progress and stats['iterations']%25==0:progress(f'cg_iteration_{stats["iterations"]}')
         y,info=cg(scaled,b,M=hierarchy.aspreconditioner(),rtol=rtol,atol=0,maxiter=maxiter,callback=callback)
         if info!=0:raise ValueError(f'AMG/CG 未收敛，info={info}，iterations={stats["iterations"]}；未自动转入高内存直接求解')
-    x=scale*y;residual=float(np.linalg.norm(A@x-rhs)/np.linalg.norm(rhs))
+    x=scale*y
+    full=np.zeros(K.shape[0]);full[free]=x
+    residual=float(np.linalg.norm((K@full)[free]-rhs)/np.linalg.norm(rhs))
     if not np.isfinite(x).all() or residual>1e-6:raise ValueError(f'原始系统残差检查失败：{residual:.3g}')
     stats.update(seconds=time.perf_counter()-started,relative_residual=residual)
     return x,stats

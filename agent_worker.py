@@ -21,22 +21,35 @@ class JobError(Exception):
 def validate_case(cfg,base):
     if not isinstance(cfg,dict):raise JobError('INVALID_CASE','工况必须为 JSON 对象')
     allowed={'stl','size','pitch','gcode','offset','angle','build_axis','material','fixed','loaded','force',
-             'mesh_mode','snap_tolerance','solver','rtol','maxiter','chunk_size','load_point','surface_remesh_mm'}
+             'mesh_mode','snap_tolerance','solver','rtol','maxiter','chunk_size','load_point','surface_remesh_mm',
+             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode','tetgen_radius_edge','max_elements','tetwild_stop_energy','tetwild_max_iterations','tetwild_quality_policy','refinement_strategy'}
     if set(cfg)-allowed:raise JobError('INVALID_CASE',f'未知工况字段：{sorted(set(cfg)-allowed)}')
     cfg={'stl':'','size':[40,12,8],'pitch':DEFAULT_PITCH_MM,'gcode':'','offset':[0,0,0],'angle':0,
          'build_axis':'Z','material':{},'fixed':'X-','loaded':'X+','force':[0,0,-10],
-         'mesh_mode':DEFAULT_MESH_MODE,'snap_tolerance':.0001,'surface_remesh_mm':0,'solver':'auto','rtol':1e-9,'maxiter':2000,'chunk_size':4096,**cfg}
+         'mesh_mode':DEFAULT_MESH_MODE,'snap_tolerance':.0001,'surface_remesh_mm':0,'solver':'auto','rtol':1e-9,'maxiter':2000,'chunk_size':4096,
+         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'','tetgen_radius_edge':1.4,'max_elements':600000,'tetwild_stop_energy':None,'tetwild_max_iterations':80,'tetwild_quality_policy':'target','refinement_strategy':'independent',**cfg}
     def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
     for key in ('pitch','angle'):
         if not number(cfg[key]):raise JobError('INVALID_CASE',f'{key} 必须为有限数值')
     if cfg['pitch']<=0:raise JobError('INVALID_CASE','pitch 必须大于零')
     if cfg['mesh_mode'] not in ('voxel','tetra'):raise JobError('INVALID_CASE','mesh_mode 必须为 voxel/tetra')
+    if cfg['tetra_backend'] not in ('tetgen','tetwild'):raise JobError('INVALID_CASE','tetra_backend 必须为 tetgen/tetwild')
+    if not number(cfg['tetgen_radius_edge']) or not 1.2<=cfg['tetgen_radius_edge']<=3:raise JobError('INVALID_CASE','tetgen_radius_edge 范围为 1.2–3')
+    if cfg['tetwild_quality_policy'] not in ('target','measured'):raise JobError('INVALID_CASE','tetwild_quality_policy must be target/measured')
+    if cfg['tetwild_quality_policy']=='measured' and (cfg['tetra_backend']!='tetwild' or cfg['tetwild_mode']!='fast'):raise JobError('INVALID_CASE','measured quality policy requires fast backend')
+    if cfg['tetwild_stop_energy'] is not None and (not number(cfg['tetwild_stop_energy']) or not 10<=cfg['tetwild_stop_energy']<=100):raise JobError('INVALID_CASE','tetwild_stop_energy 范围为 10–100 或 null')
+    if cfg['tetwild_mode'] not in ('modern','legacy','fast'):raise JobError('INVALID_CASE','tetwild_mode 必须为 modern/legacy/fast')
+    if not number(cfg['surface_tolerance_mm']) or not 0<cfg['surface_tolerance_mm']<=.015:raise JobError('INVALID_CASE','surface_tolerance_mm 范围为 (0,0.015] mm')
+    if cfg['tetra_backend']=='tetwild' and (cfg['mesh_mode']!='tetra' or not cfg['stl'] or cfg['surface_remesh_mm']):
+        raise JobError('INVALID_CASE','TetWild 需要 STL、tetra 模式，且不能同时使用 surface_remesh_mm')
+    if cfg['refinement_strategy'] not in ('independent','uniform'):raise JobError('INVALID_CASE','refinement_strategy must be independent/uniform')
+    if cfg['refinement_strategy']=='uniform' and cfg['mesh_mode']!='tetra':raise JobError('INVALID_CASE','uniform refinement requires tetra mesh')
     if cfg['solver'] not in ('auto','direct','amg'):raise JobError('INVALID_CASE','solver 必须为 auto/direct/amg')
     if not number(cfg['snap_tolerance']) or not 0<=cfg['snap_tolerance']<=.01:raise JobError('INVALID_CASE','snap_tolerance 范围为 0–0.01 mm')
     if not number(cfg['surface_remesh_mm']) or not 0<=cfg['surface_remesh_mm']<=5:raise JobError('INVALID_CASE','surface_remesh_mm 范围为 0–5 mm')
     if cfg['surface_remesh_mm'] and (cfg['mesh_mode']!='tetra' or not cfg['stl']):raise JobError('INVALID_CASE','表面重网格需要 STL 与 tetra 模式')
     if not number(cfg['rtol']) or not 0<cfg['rtol']<=1e-4:raise JobError('INVALID_CASE','rtol 范围为 (0,1e-4]')
-    for key,lo,hi in [('maxiter',1,10000),('chunk_size',128,16384)]:
+    for key,lo,hi in [('maxiter',1,10000),('chunk_size',128,16384),('max_elements',1,5000000),('tetwild_max_iterations',1,200)]:
         if not isinstance(cfg[key],int) or isinstance(cfg[key],bool) or not lo<=cfg[key]<=hi:raise JobError('INVALID_CASE',f'{key} 范围 {lo}–{hi}')
     for key in ('size','offset','force'):
         if not isinstance(cfg[key],list) or len(cfg[key])!=3 or not all(map(number,cfg[key])):
@@ -51,6 +64,14 @@ def validate_case(cfg,base):
     except (ValueError,TypeError) as exc:raise JobError('INVALID_MATERIAL',str(exc)) from exc
     for key in ('fixed','loaded'):
         value=cfg[key]
+        if isinstance(value,dict):
+            if set(value)!={'boxes'} or not isinstance(value['boxes'],list) or not 1<=len(value['boxes'])<=64:
+                raise JobError('INVALID_CASE',f'{key} 需包含1–64个 boxes')
+            for box in value['boxes']:
+                if not isinstance(box,list) or len(box)!=2 or any(not isinstance(row,list) or len(row)!=3 or not all(map(number,row)) for row in box):
+                    raise JobError('INVALID_CASE',f'{key} 子区域格式无效')
+                if np.any(np.array(box[0])>box[1]):raise JobError('INVALID_CASE',f'{key} 子区域范围颠倒')
+            continue
         if isinstance(value,str):
             if value not in ('X-','X+','Y-','Y+','Z-','Z+'):raise JobError('INVALID_CASE',f'{key} 面名称无效')
         else:
@@ -58,6 +79,9 @@ def validate_case(cfg,base):
                 if not isinstance(value,list) or len(value)!=2 or any(not isinstance(row,list) or len(row)!=3 or not all(map(number,row)) for row in value):raise ValueError()
                 if np.any(np.array(value[0])>value[1]):raise ValueError()
             except (ValueError,TypeError):raise JobError('INVALID_CASE',f'{key} 需为 [[xmin,ymin,zmin],[xmax,ymax,zmax]]')
+    if not isinstance(cfg['mesh_cache_dir'],str):raise JobError('INVALID_CASE','mesh_cache_dir 必须为目录字符串')
+    if cfg['mesh_cache_dir']:
+        p=Path(cfg['mesh_cache_dir']);cfg['mesh_cache_dir']=str((p if p.is_absolute() else Path(base)/p).resolve())
     for key in ('stl','gcode'):
         if not isinstance(cfg[key],str):raise JobError('INVALID_CASE',f'{key} 必须为文件路径字符串')
         if cfg[key]:
@@ -86,12 +110,20 @@ def diagnostics(cfg,r,segments):
         tri=nodes[selected];areas=np.linalg.norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]),axis=1)/2
         checks.append(check('REGION_'+key.upper(),'warn' if len(selected)<4 else 'pass',
                             '区域按表面中心选择；面积仅用于核对，不能自动判断是否符合真实安装条件',faces=len(selected),area_mm2=float(areas.sum()),bounds=[tri.min(axis=(0,1)).tolist(),tri.max(axis=(0,1)).tolist()]))
+        if isinstance(cfg[key],dict):
+            for i,box in enumerate(cfg[key]['boxes']):
+                patch=faces[select_faces(nodes,faces,box)];xyz=nodes[patch]
+                area=np.linalg.norm(np.cross(xyz[:,1]-xyz[:,0],xyz[:,2]-xyz[:,0]),axis=1).sum()/2
+                checks.append(check(f'REGION_{key.upper()}_{i}','pass' if len(patch)>=4 else 'warn','独立安装/加载区域',faces=len(patch),area_mm2=float(area),bounds=[xyz.min(axis=(0,1)).tolist(),xyz.max(axis=(0,1)).tolist()]))
     extent=np.ptp(nodes,axis=0)
     checks.append(check('MESH_RESOLUTION','warn' if extent.min()/pitch<4 else 'pass','包围盒最短方向网格数检查；不替代局部薄壁检测',min_extent_over_pitch=float(extent.min()/pitch)))
     if cfg['stl'] and r.get('mesh_info',{}).get('mode')=='tetra':
         info=r['mesh_info']
-        checks.append(check('GEOMETRY_APPROXIMATION','pass' if info['volume_relative_error']<.002 else 'warn','贴体四面体保留清理后的表面；数值清理容差与体积偏差已记录',**info))
+        checks.append(check('GEOMETRY_APPROXIMATION','pass' if info['volume_relative_error']<.002 else 'warn','贴体四面体几何审计；表面变化策略、容差与体积偏差已记录',**info))
         checks.append(check('ELEMENT_QUALITY','warn' if info['low_quality_fraction']>.001 or info['quality_min']<1e-6 else 'pass','几何细节附近仍可能产生扁薄单元；需结合原始系统残差与收敛检查',quality_min=info['quality_min'],low_quality_fraction=info['low_quality_fraction']))
+        report=info.get('backend_report',{})
+        if 'optimization_target_met' in report:
+            checks.append(check('MESHER_OPTIMIZATION','pass' if report['optimization_target_met'] else 'warn','优化器目标与实测单元质量分开记录；未达优化目标不等于已验证精度',**report))
         sizing=volume_resolution(info)
         checks.append(check('MESH_VOLUME_SIZE',sizing.pop('status'),
                             '实际单元体积及按材料体积加权的p95与目标比较；表面节点数不能替代体积细化',**sizing))
@@ -143,7 +175,11 @@ def convergence_check(base,fine,du,ds,force):
 
 
 def metrics(r):
+    force_norm=float(np.linalg.norm(r['forces'].sum(axis=0)))
     return dict(nodes=len(r['nodes']),elements=len(r['cells']),
+                strain_energy_Nmm=float(r['energy']),
+                work_conjugate_displacement_mm=2*float(r['energy'])/force_norm if force_norm else None,
+                compliance_mm_per_N=2*float(r['energy'])/force_norm**2 if force_norm else None,
                 max_displacement_mm=float(np.linalg.norm(r['displacement'],axis=1).max()),
                 stress_p95_MPa=float(np.percentile(r['von_mises'],95)),max_von_mises_MPa=float(r['von_mises'].max()),
                 reaction_N=r['reactions'].sum(axis=0).tolist(),relative_residual=float(r['relative_residual']),volume_mm3=r['volume'],solver=r.get('solver_info',{}),mesh=r.get('mesh_info',{}))
@@ -206,13 +242,25 @@ def worker_main(queue,cfg,base,directory,options):
                 inputs[key]={'path':cfg[key],'sha256':digest.hexdigest()}
         emit('gcode_read');segments=read_gcode(cfg['gcode']) if cfg['gcode'] else None
         mesh_cache={}
-        def compute(case,label):
+        def compute(case,label,parent=None):
             emit(label+'.mesh')
-            key=(case['stl'],case['pitch'],case['mesh_mode'],case['snap_tolerance'],case['surface_remesh_mm'])
+            key=(case['stl'],case['pitch'],case['mesh_mode'],case['snap_tolerance'],case['surface_remesh_mm'],case['tetra_backend'],case['surface_tolerance_mm'],case['tetwild_mode'],case['tetgen_radius_edge'],case['max_elements'],case['tetwild_stop_energy'],case['tetwild_max_iterations'],case['tetwild_quality_policy'])
+            key+=(parent is not None,)
             if key not in mesh_cache:
-                if case['stl'] and case['mesh_mode']=='tetra':
-                    from meshing import tetra_mesh
-                    mesh_cache[key]=tetra_mesh(case['stl'],case['pitch'],case['snap_tolerance'],surface_remesh_mm=case['surface_remesh_mm'])
+                if parent is not None:
+                    from refinement import refine_tetra
+                    from mesh_cache import cached_mesh
+                    digest=hashlib.sha256(parent['nodes'].tobytes());digest.update(parent['cells'].tobytes())
+                    digest.update(Path(__file__).with_name('refinement.py').read_bytes())
+                    mesh_cache[key]=cached_mesh(case,lambda:refine_tetra(parent['nodes'],parent['cells'],parent['mesh_info'],case['pitch'],case['max_elements']),variant='uniform:'+digest.hexdigest())
+                elif case['stl'] and case['mesh_mode']=='tetra':
+                    from mesh_cache import cached_mesh
+                    if case['tetra_backend']=='tetwild':
+                        from robust_meshing import tetra_mesh_robust
+                        mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh_robust(case['stl'],case['pitch'],case['snap_tolerance'],case['surface_tolerance_mm'],mode=case['tetwild_mode'],max_elements=case['max_elements'],stop_energy=case['tetwild_stop_energy'],max_iterations=case['tetwild_max_iterations'],quality_policy=case['tetwild_quality_policy']))
+                    else:
+                        from meshing import tetra_mesh
+                        mesh_cache[key]=cached_mesh(case,lambda:tetra_mesh(case['stl'],case['pitch'],case['snap_tolerance'],surface_remesh_mm=case['surface_remesh_mm'],radius_edge=case['tetgen_radius_edge'],max_elements=case['max_elements']))
                 else:
                     n,c=stl_mesh(case['stl'],case['pitch']) if case['stl'] else box_mesh(case['size'],case['pitch'])
                     mesh_cache[key]=(n,c,{'mode':'voxel'})
@@ -231,9 +279,12 @@ def worker_main(queue,cfg,base,directory,options):
         r=compute(cfg,'base');emit('checks');checks=diagnostics(cfg,r,segments)
         runs=[dict(name='base',pitch=cfg['pitch'],angle=cfg['angle'],metrics=metrics(r))]
         if options['convergence']:
-            refined={**cfg,'pitch':cfg['pitch']/1.5}
+            uniform=cfg['refinement_strategy']=='uniform'
+            refined={**cfg,'pitch':cfg['pitch']/(2 if uniform else 1.5)}
             try:
-                fine=compute(refined,'refined');fm=metrics(fine);bm=runs[0]['metrics']
+                fine=compute(refined,'refined',r if uniform else None);fm=metrics(fine);bm=runs[0]['metrics']
+                for item in diagnostics(refined,fine,segments):
+                    checks.append({**item,'code':'REFINED_'+item['code']})
                 du=abs(fm['max_displacement_mm']-bm['max_displacement_mm'])/max(fm['max_displacement_mm'],1e-20)
                 ds=abs(fm['stress_p95_MPa']-bm['stress_p95_MPa'])/max(fm['stress_p95_MPa'],1e-20)
                 checks.append(convergence_check(r,fine,du,ds,cfg['force']))
@@ -254,13 +305,14 @@ def worker_main(queue,cfg,base,directory,options):
                 runs.append(dict(name=f'angle_{i}',pitch=case['pitch'],angle=angle,metrics=metrics(result)))
                 write_npz(out/f'angle_{i}.npz',result);del result
         emit('export');write_vtk(out/'result.vtk',r);write_npz(out/'result.npz',r)
-        summary=dict(settings=cfg,inputs=inputs,units='mm,N,MPa',metrics=metrics(r),checks=checks,checks_scope='base_case_only',runs=runs,
+        summary=dict(settings=cfg,inputs=inputs,units='mm,N,MPa',metrics=metrics(r),checks=checks,checks_scope='base_and_available_refined_cases',runs=runs,
                      quality='needs_review' if any(c['status'] in ('warn','not_checked') for c in checks) else 'numerical_checks_passed',scope='numerical_screening_only')
         emit('render');render(r,out/'preview.png');write_report(out/'report.html',summary)
         (out/'analysis.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
         queue.put({'type':'complete','summary':summary})
     except Exception as exc:
         if isinstance(exc,JobError):code=exc.code
+        elif isinstance(exc,ModuleNotFoundError):code='DEPENDENCY_MISSING'
         elif isinstance(exc,MemoryError):code='MEMORY_LIMIT'
         elif isinstance(exc,(ValueError,TypeError)):
             code='MESH_ERROR' if stage.endswith('.mesh') else ('GCODE_ERROR' if stage=='gcode_read' else 'SOLVER_ERROR')
