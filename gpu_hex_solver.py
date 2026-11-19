@@ -1,6 +1,7 @@
 """GPU-accelerated Matrix-Free H8 solver with hybrid GMG-PCG and mixed-precision IR."""
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import struct
 import time
@@ -22,11 +23,112 @@ from numerics import rigid_modes
 from solid import Material, local_stiffness
 from toolpath_bricks import (
     FEATURE_NAMES,
+    FLAG_BEAD_INTERFACE,
+    FLAG_SEAM_LOOP,
+    FLAG_START_STOP_ZONE,
     BrickGrid,
     decode_feature,
     popcount_uint64,
     unpack_payload,
 )
+
+
+@dataclass
+class HexInterfaceConfig:
+    """Per-voxel interface stiffness scaling factors for H8 Route-2 weakening."""
+
+    seam_factor: float = 1.0
+    start_stop_factor: float = 1.0
+    bead_interface_factor: float = 1.0
+    interlayer_shear_factor: float = 1.0
+
+    @classmethod
+    def ideal(cls):
+        return cls()
+
+    @classmethod
+    def default_weakened(cls):
+        return cls(
+            seam_factor=0.5,
+            start_stop_factor=0.8,
+            bead_interface_factor=0.85,
+            interlayer_shear_factor=0.85,
+        )
+
+    @classmethod
+    def from_dict(cls, data):
+        if data is None:
+            return cls()
+        if not isinstance(data, dict):
+            raise ValueError("hex_interface_config must be a JSON object")
+        d = dict(data)
+        weakened = bool(d.pop("weakened", False))
+        cfg = cls.default_weakened() if weakened else cls()
+        valid = set(cls.__dataclass_fields__)
+        unknown = set(d) - valid
+        if unknown:
+            raise ValueError(f"Unknown hex_interface_config keys: {sorted(unknown)}")
+        for k, v in d.items():
+            fv = float(v)
+            if not math.isfinite(fv) or fv <= 0.0:
+                raise ValueError(f"hex_interface_config.{k} must be positive finite")
+            setattr(cfg, k, fv)
+        return cfg
+
+    def is_weakened(self):
+        return any(
+            abs(v - 1.0) > 1e-9
+            for v in (
+                self.seam_factor,
+                self.start_stop_factor,
+                self.bead_interface_factor,
+                self.interlayer_shear_factor,
+            )
+        )
+
+    def flag_scale_lut(self):
+        lut = np.ones(8, dtype=np.float64)
+        for code in range(8):
+            has_ss = bool(code & 1)
+            has_iface = bool(code & 2)
+            has_seam = bool(code & 4)
+            if has_seam and has_ss:
+                end_fac = min(float(self.seam_factor), float(self.start_stop_factor))
+            elif has_seam:
+                end_fac = float(self.seam_factor)
+            elif has_ss:
+                end_fac = float(self.start_stop_factor)
+            else:
+                end_fac = 1.0
+            iface_fac = float(self.bead_interface_factor) if has_iface else 1.0
+            lut[code] = end_fac * iface_fac
+        return lut
+
+    def effective_material(self, material: Material):
+        f = float(self.interlayer_shear_factor)
+        if abs(f - 1.0) <= 1e-12:
+            return material
+        eff = Material(
+            e1=material.e1,
+            e2=material.e2,
+            e3=material.e3 * f,
+            g12=material.g12,
+            g23=material.g23 * f,
+            g13=material.g13 * f,
+            nu12=material.nu12,
+            nu23=material.nu23,
+            nu13=material.nu13,
+        )
+        local_stiffness(eff)
+        return eff
+
+    def to_dict(self):
+        return {
+            "seam_factor": float(self.seam_factor),
+            "start_stop_factor": float(self.start_stop_factor),
+            "bead_interface_factor": float(self.bead_interface_factor),
+            "interlayer_shear_factor": float(self.interlayer_shear_factor),
+        }
 
 
 _WARP_INIT = False
@@ -57,6 +159,7 @@ def _matvec_color_f32_kernel(
     brick_nodes: wp.array(dtype=wp.int32, ndim=2),
     brick_payload: wp.array(dtype=wp.uint32, ndim=2),
     ke_lut: wp.array(dtype=wp.float32, ndim=3),
+    flag_scale_lut: wp.array(dtype=wp.float32, ndim=1),
     x: wp.array(dtype=wp.float32, ndim=1),
     y: wp.array(dtype=wp.float32, ndim=1),
 ):
@@ -71,7 +174,8 @@ def _matvec_color_f32_kernel(
 
     p = brick_payload[bid, c]
     abin = wp.int32(p & wp.uint32(0xFFFF))
-    rho = wp.float32((p >> wp.uint32(16)) & wp.uint32(0xFF)) * wp.float32(1.0 / 255.0)
+    fcode = wp.int32((p >> wp.uint32(29)) & wp.uint32(7))
+    rho = wp.float32((p >> wp.uint32(16)) & wp.uint32(0xFF)) * wp.float32(1.0 / 255.0) * flag_scale_lut[fcode]
 
     n0 = brick_nodes[bid, base]
     n1 = brick_nodes[bid, base + 1]
@@ -127,6 +231,7 @@ def _matvec_color_f64_kernel(
     brick_nodes: wp.array(dtype=wp.int32, ndim=2),
     brick_payload: wp.array(dtype=wp.uint32, ndim=2),
     ke_lut: wp.array(dtype=wp.float64, ndim=3),
+    flag_scale_lut: wp.array(dtype=wp.float64, ndim=1),
     x: wp.array(dtype=wp.float64, ndim=1),
     y: wp.array(dtype=wp.float64, ndim=1),
 ):
@@ -141,7 +246,8 @@ def _matvec_color_f64_kernel(
 
     p = brick_payload[bid, c]
     abin = wp.int32(p & wp.uint32(0xFFFF))
-    rho = wp.float64((p >> wp.uint32(16)) & wp.uint32(0xFF)) * wp.float64(1.0 / 255.0)
+    fcode = wp.int32((p >> wp.uint32(29)) & wp.uint32(7))
+    rho = wp.float64((p >> wp.uint32(16)) & wp.uint32(0xFF)) * wp.float64(1.0 / 255.0) * flag_scale_lut[fcode]
 
     n0 = brick_nodes[bid, base]
     n1 = brick_nodes[bid, base + 1]
@@ -197,6 +303,7 @@ def _diag_color_f32_kernel(
     brick_nodes: wp.array(dtype=wp.int32, ndim=2),
     brick_payload: wp.array(dtype=wp.uint32, ndim=2),
     ke_diag: wp.array(dtype=wp.float32, ndim=2),
+    flag_scale_lut: wp.array(dtype=wp.float32, ndim=1),
     diag: wp.array(dtype=wp.float32, ndim=1),
 ):
     tid = wp.tid()
@@ -210,7 +317,8 @@ def _diag_color_f32_kernel(
 
     p = brick_payload[bid, c]
     abin = wp.int32(p & wp.uint32(0xFFFF))
-    rho = wp.float32((p >> wp.uint32(16)) & wp.uint32(0xFF)) * wp.float32(1.0 / 255.0)
+    fcode = wp.int32((p >> wp.uint32(29)) & wp.uint32(7))
+    rho = wp.float32((p >> wp.uint32(16)) & wp.uint32(0xFF)) * wp.float32(1.0 / 255.0) * flag_scale_lut[fcode]
 
     n0 = brick_nodes[bid, base]
     n1 = brick_nodes[bid, base + 1]
@@ -399,6 +507,59 @@ def _gpu_dot_f32(a, b, scratch_256, device):
     scratch_256.zero_()
     wp.launch(_dot_reduce_f32_kernel, dim=len(a), inputs=[a, b, scratch_256], device=device)
     return float(scratch_256.numpy().sum())
+
+
+@wp.kernel
+def _dot_reduce_f64_kernel(
+    a: wp.array(dtype=wp.float64, ndim=1),
+    b: wp.array(dtype=wp.float64, ndim=1),
+    out_sum: wp.array(dtype=wp.float64, ndim=1),
+):
+    tid = wp.tid()
+    bucket = tid & 255
+    wp.atomic_add(out_sum, bucket, a[tid] * b[tid])
+
+
+def _gpu_dot_f64(a, b, scratch_256, device):
+    scratch_256.zero_()
+    wp.launch(_dot_reduce_f64_kernel, dim=len(a), inputs=[a, b, scratch_256], device=device)
+    return float(scratch_256.numpy().sum())
+
+
+@wp.kernel
+def _axpby_f64_kernel(
+    alpha: wp.float64,
+    x: wp.array(dtype=wp.float64, ndim=1),
+    beta: wp.float64,
+    y: wp.array(dtype=wp.float64, ndim=1),
+    out: wp.array(dtype=wp.float64, ndim=1),
+):
+    i = wp.tid()
+    out[i] = alpha * x[i] + beta * y[i]
+
+
+@wp.kernel
+def _scale_f32_to_f64_masked_kernel(
+    scale: wp.float64,
+    fixed_mask: wp.array(dtype=wp.uint8, ndim=1),
+    x32: wp.array(dtype=wp.float32, ndim=1),
+    out64: wp.array(dtype=wp.float64, ndim=1),
+):
+    i = wp.tid()
+    if fixed_mask[i // 3] != wp.uint8(0):
+        out64[i] = wp.float64(0.0)
+    else:
+        out64[i] = scale * wp.float64(x32[i])
+
+
+@wp.kernel
+def _scale_f64_to_f32_kernel(
+    scale: wp.float64,
+    x64: wp.array(dtype=wp.float64, ndim=1),
+    out32: wp.array(dtype=wp.float32, ndim=1),
+):
+    i = wp.tid()
+    out32[i] = wp.float32(scale * x64[i])
 
 
 def _build_brick_lookup(brick_coords, brick_shape):
@@ -608,7 +769,7 @@ def quad_surface_load(node_xyz, selected_quads, n_nodes, force, load_point=None)
     return f_full
 
 
-def coarsen_brick_grid(grid: BrickGrid):
+def coarsen_brick_grid(grid: BrickGrid, flag_scale_lut=None):
     """Coarsen 4x4x4 bricks 2x2x2 -> 1 while packing into coarse 4x4x4 bricks."""
     coords = grid.brick_coords
     masks = grid.brick_masks
@@ -640,8 +801,11 @@ def coarsen_brick_grid(grid: BrickGrid):
     sum_s2 = np.zeros((n_cb, 64), dtype=np.float64)
     c_masks = np.zeros(n_cb, dtype=np.uint64)
 
-    abin_all, rho_q_all, _ = unpack_payload(payload)
+    abin_all, rho_q_all, flags_all = unpack_payload(payload)
     rho_all = rho_q_all.astype(np.float64) / 255.0
+    if flag_scale_lut is not None:
+        fl_lut = np.asarray(flag_scale_lut, dtype=np.float64)
+        rho_all = rho_all * fl_lut[(flags_all >> 5) & 7]
     ang_all = bin_to_angle(abin_all, n_bins)
     c2_all = rho_all * np.cos(2.0 * ang_all)
     s2_all = rho_all * np.sin(2.0 * ang_all)
@@ -740,11 +904,12 @@ def build_prolongation_map(fine_ijk, fine_fixed_mask, coarse_grid: BrickGrid, co
     return fine_parents, fine_weights, coarse_fixed
 
 
-def assemble_coarse_csr(grid: BrickGrid, brick_nodes, n_nodes, Ke_f64):
+def assemble_coarse_csr(grid: BrickGrid, brick_nodes, n_nodes, Ke_f64, flag_scale_lut=None):
     """Assemble global sparse stiffness matrix (3*N, 3*N) in CSR for coarsest level."""
     levels = []
     masks = grid.brick_masks
     payload = grid.brick_payload
+    fl_lut = None if flag_scale_lut is None else np.asarray(flag_scale_lut, dtype=np.float64)
 
     all_bids = []
     all_cs = []
@@ -772,6 +937,9 @@ def assemble_coarse_csr(grid: BrickGrid, brick_nodes, n_nodes, Ke_f64):
         p_ch = payload[b_ch, c_ch]
         abin = (p_ch & np.uint32(0xFFFF)).astype(np.int32)
         rho = ((p_ch >> np.uint32(16)) & np.uint32(0xFF)).astype(np.float64) / 255.0
+        if fl_lut is not None:
+            fcode = ((p_ch >> np.uint32(29)) & np.uint32(7)).astype(np.int32)
+            rho = rho * fl_lut[fcode]
         ke = Ke_f64[abin] * rho[:, None, None]
         rows = np.repeat(dofs, 24, axis=1).ravel()
         cols = np.tile(dofs, (1, 24)).ravel()
@@ -803,6 +971,7 @@ class _GPUMGLevel:
     brick_payload_dev: object
     color_cells_dev: list
     ke_f32_dev: object
+    flag_scale_lut_dev: object
     fixed_mask_dev: object
     diag_inv_dev: object
     lambda_max: float
@@ -825,13 +994,13 @@ def _launch_matvec_f32(level: _GPUMGLevel, x_dev, y_dev, device):
         wp.launch(
             _matvec_color_f32_kernel,
             dim=len(c_dev),
-            inputs=[c_dev, level.brick_nodes_dev, level.brick_payload_dev, level.ke_f32_dev, x_dev, y_dev],
+            inputs=[c_dev, level.brick_nodes_dev, level.brick_payload_dev, level.ke_f32_dev, level.flag_scale_lut_dev, x_dev, y_dev],
             device=device,
         )
     wp.launch(_apply_fixed_mask_f32_kernel, dim=level.n_nodes, inputs=[level.fixed_mask_dev, y_dev], device=device)
 
 
-def _launch_matvec_f64(color_cells_dev, brick_nodes_dev, brick_payload_dev, ke_f64_dev, fixed_mask_dev, n_nodes, x_dev, y_dev, device, apply_fixed_mask=True):
+def _launch_matvec_f64(color_cells_dev, brick_nodes_dev, brick_payload_dev, ke_f64_dev, flag_scale_lut_f64_dev, fixed_mask_dev, n_nodes, x_dev, y_dev, device, apply_fixed_mask=True):
     y_dev.zero_()
     for c_dev in color_cells_dev:
         if len(c_dev) == 0:
@@ -839,7 +1008,7 @@ def _launch_matvec_f64(color_cells_dev, brick_nodes_dev, brick_payload_dev, ke_f
         wp.launch(
             _matvec_color_f64_kernel,
             dim=len(c_dev),
-            inputs=[c_dev, brick_nodes_dev, brick_payload_dev, ke_f64_dev, x_dev, y_dev],
+            inputs=[c_dev, brick_nodes_dev, brick_payload_dev, ke_f64_dev, flag_scale_lut_f64_dev, x_dev, y_dev],
             device=device,
         )
     if apply_fixed_mask:
@@ -899,21 +1068,22 @@ def _chebyshev_smooth_f32(level: _GPUMGLevel, b_dev, x_dev, r_dev, d_dev, ax_dev
 def solve_hex_gpu(
     grid: BrickGrid,
     material=None,
+    interface_cfg: HexInterfaceConfig = None,
     fixed="X-",
     loaded="X+",
     force=(0.0, 0.0, -10.0),
     load_point=None,
     build_axis="Z",
     rtol=1e-7,
-    max_outer_ir=20,
+    max_outer_ir=30,
     max_inner_iter=200,
-    max_levels=5,
-    coarse_dof_target=25000,
+    max_levels=6,
+    coarse_dof_target=12000,
     smooth_degree=2,
     device="auto",
     progress=None,
 ):
-    """Solve H8 orthotropic linear elasticity on sparse 4x4x4 bricks with RTX 4070 GMG-PCG + fp64 IR."""
+    """Solve H8 orthotropic linear elasticity on sparse 4x4x4 bricks with RTX 4070 GMG-PCG + fp64 Truncated FCG."""
     t_total = time.perf_counter()
     progress = progress or (lambda stage: None)
     if build_axis not in ("X", "Y", "Z"):
@@ -922,6 +1092,12 @@ def solve_hex_gpu(
         raise ValueError("rtol must be in (0, 1e-4]")
     material = material or Material()
     local_stiffness(material)
+    interface_cfg = interface_cfg or HexInterfaceConfig()
+    eff_material = interface_cfg.effective_material(material)
+    flag_lut_f64 = interface_cfg.flag_scale_lut()
+    flag_lut_f32 = flag_lut_f64.astype(np.float32)
+    unit_lut_f32 = np.ones(8, dtype=np.float32)
+
     force = np.asarray(force, dtype=np.float64)
     if force.shape != (3,) or not np.isfinite(force).all():
         raise ValueError("force must be a finite 3-vector")
@@ -990,22 +1166,24 @@ def solve_hex_gpu(
     cg_z = wp.zeros(n_dofs, dtype=wp.float32, device=used_device)
     scratch_256 = wp.zeros(256, dtype=wp.float64, device=used_device)
 
-    ke_l0_f64, ke_l0_f32, D_local = build_stiffness_lut(material, dx, dy, dz, n_bins=n_bins, build_axis=build_axis)
+    ke_l0_f64, ke_l0_f32, D_local = build_stiffness_lut(eff_material, dx, dy, dz, n_bins=n_bins, build_axis=build_axis)
+    flag_lut_f64_dev = wp.array(flag_lut_f64, dtype=wp.float64, device=used_device)
 
-    def _make_gpu_level(lvl_idx, g, bnodes, colors, fmask, ke32_np):
+    def _make_gpu_level(lvl_idx, g, bnodes, colors, fmask, ke32_np, lut_f32):
         nn = len(fmask)
         nd = 3 * nn
         bn_dev = wp.array(bnodes, dtype=wp.int32, device=used_device)
         bp_dev = wp.array(g.brick_payload, dtype=wp.uint32, device=used_device)
         cc_dev = [wp.array(c, dtype=wp.int32, device=used_device) for c in colors]
         ke_dev = wp.array(ke32_np, dtype=wp.float32, device=used_device)
+        lut_dev = wp.array(lut_f32, dtype=wp.float32, device=used_device)
         fm_dev = wp.array(fmask, dtype=wp.uint8, device=used_device)
         ke_diag_np = np.ascontiguousarray(np.diagonal(ke32_np, axis1=1, axis2=2), dtype=np.float32)
         kd_dev = wp.array(ke_diag_np, dtype=wp.float32, device=used_device)
         diag_dev = wp.zeros(nd, dtype=wp.float32, device=used_device)
         for c_d in cc_dev:
             if len(c_d):
-                wp.launch(_diag_color_f32_kernel, dim=len(c_d), inputs=[c_d, bn_dev, bp_dev, kd_dev, diag_dev], device=used_device)
+                wp.launch(_diag_color_f32_kernel, dim=len(c_d), inputs=[c_d, bn_dev, bp_dev, kd_dev, lut_dev, diag_dev], device=used_device)
         diag_host = diag_dev.numpy()
         free_d = ~np.repeat(fmask != 0, 3)
         if np.any(diag_host[free_d] <= 0):
@@ -1022,6 +1200,7 @@ def solve_hex_gpu(
             brick_payload_dev=bp_dev,
             color_cells_dev=cc_dev,
             ke_f32_dev=ke_dev,
+            flag_scale_lut_dev=lut_dev,
             fixed_mask_dev=fm_dev,
             diag_inv_dev=dinv_dev,
             lambda_max=2.0,
@@ -1034,7 +1213,7 @@ def solve_hex_gpu(
             lvl_obj.d_dev = wp.zeros(nd, dtype=wp.float32, device=used_device)
         return lvl_obj
 
-    lvl0 = _make_gpu_level(0, cur_grid, cur_bnodes, cur_colors, cur_fixed, ke_l0_f32)
+    lvl0 = _make_gpu_level(0, cur_grid, cur_bnodes, cur_colors, cur_fixed, ke_l0_f32, flag_lut_f32)
     lvl0.lambda_max = _estimate_lambda_max(lvl0, scratch_256, cg_x, cg_r, used_device)
     levels.append(lvl0)
 
@@ -1044,7 +1223,7 @@ def solve_hex_gpu(
         cur_free_dofs = int(3 * (cur_fixed == 0).sum())
         if cur_free_dofs <= coarse_dof_target:
             break
-        c_grid = coarsen_brick_grid(cur_grid)
+        c_grid = coarsen_brick_grid(cur_grid, flag_scale_lut=flag_lut_f64 if lvl_idx == 1 else None)
         c_ijk, c_keys, c_bnodes, c_colors = build_level_topology(c_grid)
         f_parents, f_weights, c_fixed = build_prolongation_map(cur_ijk, cur_fixed, c_grid, c_keys)
         c_free_dofs = int(3 * (c_fixed == 0).sum())
@@ -1053,8 +1232,8 @@ def solve_hex_gpu(
         levels[-1].fine_parents_dev = wp.array(f_parents, dtype=wp.int32, device=used_device)
         levels[-1].fine_weights_dev = wp.array(f_weights, dtype=wp.float32, device=used_device)
 
-        ke_c_f64, ke_c_f32, _ = build_stiffness_lut(material, *c_grid.pitch, n_bins=n_bins, build_axis=build_axis)
-        c_lvl = _make_gpu_level(lvl_idx, c_grid, c_bnodes, c_colors, c_fixed, ke_c_f32)
+        ke_c_f64, ke_c_f32, _ = build_stiffness_lut(eff_material, *c_grid.pitch, n_bins=n_bins, build_axis=build_axis)
+        c_lvl = _make_gpu_level(lvl_idx, c_grid, c_bnodes, c_colors, c_fixed, ke_c_f32, unit_lut_f32)
         c_lvl.lambda_max = _estimate_lambda_max(c_lvl, scratch_256, c_lvl.x_dev, c_lvl.r_dev, used_device)
         levels.append(c_lvl)
 
@@ -1080,9 +1259,15 @@ def solve_hex_gpu(
     coarse_precond = None
 
     if len(levels) > 1 or len(coarse_free_idx) <= coarse_dof_target:
-        K_c = assemble_coarse_csr(cur_grid, cur_bnodes, coarsest.n_nodes, ke_cur_f64)
+        K_c = assemble_coarse_csr(
+            cur_grid,
+            cur_bnodes,
+            coarsest.n_nodes,
+            ke_cur_f64,
+            flag_scale_lut=flag_lut_f64 if len(levels) == 1 else None,
+        )
         A_c = K_c[coarse_free_idx][:, coarse_free_idx].tocsc()
-        if len(coarse_free_idx) <= 35000:
+        if len(coarse_free_idx) <= 45000:
             coarse_lu = splu(A_c)
             coarse_solver_name = "splu"
         else:
@@ -1173,25 +1358,49 @@ def solve_hex_gpu(
             u_64_host[coarse_free_idx] = coarse_lu.solve(f_64[coarse_free_idx])
             wp.copy(u64_dev, wp.from_numpy(u_64_host, dtype=wp.float64))
             _launch_matvec_f64(
-                lvl0.color_cells_dev, lvl0.brick_nodes_dev, lvl0.brick_payload_dev, ke_l0_f64_dev, lvl0.fixed_mask_dev, n_nodes, u64_dev, y64_dev, used_device, apply_fixed_mask=False
+                lvl0.color_cells_dev,
+                lvl0.brick_nodes_dev,
+                lvl0.brick_payload_dev,
+                ke_l0_f64_dev,
+                flag_lut_f64_dev,
+                lvl0.fixed_mask_dev,
+                n_nodes,
+                u64_dev,
+                y64_dev,
+                used_device,
+                apply_fixed_mask=False,
             )
             y_host = y64_dev.numpy()
             rel_res = float(np.linalg.norm(y_host[free_mask_np] - f_64[free_mask_np]) / f_norm)
             residual_history.append(rel_res)
             outer_iters = 1
         else:
-            for outer in range(max_outer_ir):
-                outer_iters = outer + 1
-                if outer == 0:
-                    r_64 = f_64.copy()
-                    r_64[~free_mask_np] = 0.0
+            m_trunc = 4 if n_dofs <= 8_000_000 else 2
+            f64_dev = wp.array(f_64, dtype=wp.float64, device=used_device)
+            r64_dev = wp.array(f_64, dtype=wp.float64, device=used_device)
+            wp.launch(_apply_fixed_mask_f64_kernel, dim=n_nodes, inputs=[lvl0.fixed_mask_dev, r64_dev], device=used_device)
+            fcg_hist = []
+            inner_cap = min(max_inner_iter, 28 if len(levels) > 1 else 60)
+            cg_v_r = wp.zeros(n_dofs, dtype=wp.float32, device=used_device)
+
+            def _apply_precond(rhs_dev, z_out_dev):
+                if len(levels) > 1 and not used_jacobi_fallback:
+                    _vcycle(0, rhs_dev, z_out_dev, cg_v_r, cg_d_tmp, cg_ap)
                 else:
-                    wp.copy(u64_dev, wp.from_numpy(u_64_host, dtype=wp.float64))
+                    wp.launch(_diag_precond_f32_kernel, dim=n_dofs, inputs=[lvl0.fixed_mask_dev, lvl0.diag_inv_dev, rhs_dev, z_out_dev], device=used_device)
+
+            r_norm = math.sqrt(max(_gpu_dot_f64(r64_dev, r64_dev, scratch_256, used_device), 0.0))
+            rel_res = r_norm / f_norm
+            residual_history.append(rel_res)
+
+            for outer in range(max_outer_ir):
+                if rel_res <= rtol:
                     _launch_matvec_f64(
                         lvl0.color_cells_dev,
                         lvl0.brick_nodes_dev,
                         lvl0.brick_payload_dev,
                         ke_l0_f64_dev,
+                        flag_lut_f64_dev,
                         lvl0.fixed_mask_dev,
                         n_nodes,
                         u64_dev,
@@ -1199,32 +1408,18 @@ def solve_hex_gpu(
                         used_device,
                         apply_fixed_mask=True,
                     )
-                    y_host = y64_dev.numpy()
-                    r_64 = f_64 - y_host
-                    r_64[~free_mask_np] = 0.0
+                    wp.launch(_axpby_f64_kernel, dim=n_dofs, inputs=[np.float64(1.0), f64_dev, np.float64(-1.0), y64_dev, r64_dev], device=used_device)
+                    wp.launch(_apply_fixed_mask_f64_kernel, dim=n_nodes, inputs=[lvl0.fixed_mask_dev, r64_dev], device=used_device)
+                    r_norm = math.sqrt(max(_gpu_dot_f64(r64_dev, r64_dev, scratch_256, used_device), 0.0))
+                    rel_res = r_norm / f_norm
+                    if rel_res <= rtol:
+                        break
 
-                r_norm = float(np.linalg.norm(r_64[free_mask_np]))
-                rel_res = r_norm / f_norm
-                residual_history.append(rel_res)
-                if rel_res <= rtol:
-                    break
-
-                # Scale inner RHS by 1/r_norm to preserve full fp32 dynamic range!
-                r_scaled_f32 = (r_64 / r_norm).astype(np.float32)
+                outer_iters = outer + 1
                 cg_x.zero_()
-                wp.copy(cg_r, wp.from_numpy(r_scaled_f32, dtype=wp.float32))
-                r0_norm_f32 = np.sqrt(max(_gpu_dot_f32(cg_r, cg_r, scratch_256, used_device), 1e-30))
-                inner_target = max(min(1e-3, rtol / max(rel_res, 1e-30) * 0.1), 5e-5)
-
-                # Apply preconditioner M^{-1} r -> z (note cg_d_tmp & cg_ap as workspace; save cg_r!).
-                if outer == 0:
-                    cg_v_r = wp.zeros(n_dofs, dtype=wp.float32, device=used_device)
-
-                def _apply_precond(rhs_dev, z_out_dev):
-                    if len(levels) > 1 and not used_jacobi_fallback:
-                        _vcycle(0, rhs_dev, z_out_dev, cg_v_r, cg_d_tmp, cg_ap)
-                    else:
-                        wp.launch(_diag_precond_f32_kernel, dim=n_dofs, inputs=[lvl0.fixed_mask_dev, lvl0.diag_inv_dev, rhs_dev, z_out_dev], device=used_device)
+                wp.launch(_scale_f64_to_f32_kernel, dim=n_dofs, inputs=[np.float64(1.0 / r_norm), r64_dev, cg_r], device=used_device)
+                r0_norm_f32 = math.sqrt(max(_gpu_dot_f32(cg_r, cg_r, scratch_256, used_device), 1e-30))
+                inner_target = 1.5e-2
 
                 _apply_precond(cg_r, cg_z)
                 rz_old = _gpu_dot_f32(cg_r, cg_z, scratch_256, used_device)
@@ -1234,28 +1429,116 @@ def solve_hex_gpu(
                     rz_old = _gpu_dot_f32(cg_r, cg_z, scratch_256, used_device)
                 wp.copy(cg_p, cg_z)
 
-                for it in range(1, max_inner_iter + 1):
+                for _it in range(1, inner_cap + 1):
                     total_inner_iters += 1
                     _launch_matvec_f32(lvl0, cg_p, cg_ap, used_device)
                     pAp = _gpu_dot_f32(cg_p, cg_ap, scratch_256, used_device)
                     if pAp <= 0.0:
                         break
-                    alpha = np.float32(rz_old / pAp)
-                    wp.launch(_axpby_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_x, alpha, cg_p, cg_x], device=used_device)
-                    wp.launch(_axpby_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_r, np.float32(-alpha), cg_ap, cg_r], device=used_device)
-                    r_cur_norm = np.sqrt(max(_gpu_dot_f32(cg_r, cg_r, scratch_256, used_device), 0.0))
+                    alpha_f32 = np.float32(rz_old / pAp)
+                    wp.launch(_axpby_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_x, alpha_f32, cg_p, cg_x], device=used_device)
+                    wp.launch(_axpby_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_r, np.float32(-alpha_f32), cg_ap, cg_r], device=used_device)
+                    r_cur_norm = math.sqrt(max(_gpu_dot_f32(cg_r, cg_r, scratch_256, used_device), 0.0))
                     if r_cur_norm / r0_norm_f32 <= inner_target:
                         break
                     _apply_precond(cg_r, cg_z)
                     rz_new = _gpu_dot_f32(cg_r, cg_z, scratch_256, used_device)
                     if rz_new <= 0.0:
                         break
-                    beta = np.float32(rz_new / rz_old)
-                    wp.launch(_axpby_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_z, beta, cg_p, cg_p], device=used_device)
+                    beta_f32 = np.float32(rz_new / rz_old)
+                    wp.launch(_axpby_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_z, beta_f32, cg_p, cg_p], device=used_device)
                     rz_old = rz_new
 
-                du_host = cg_x.numpy().astype(np.float64) * r_norm
-                u_64_host[free_mask_np] += du_host[free_mask_np]
+                if len(fcg_hist) >= m_trunc:
+                    p_dev, q_dev, _ = fcg_hist.pop(0)
+                else:
+                    p_dev = wp.zeros(n_dofs, dtype=wp.float64, device=used_device)
+                    q_dev = wp.zeros(n_dofs, dtype=wp.float64, device=used_device)
+
+                wp.launch(
+                    _scale_f32_to_f64_masked_kernel,
+                    dim=n_dofs,
+                    inputs=[np.float64(r_norm), lvl0.fixed_mask_dev, cg_x, p_dev],
+                    device=used_device,
+                )
+                for pj, qj, dj in fcg_hist:
+                    beta_j = _gpu_dot_f64(p_dev, qj, scratch_256, used_device) / dj
+                    wp.launch(_axpby_f64_kernel, dim=n_dofs, inputs=[np.float64(1.0), p_dev, np.float64(-beta_j), pj, p_dev], device=used_device)
+                wp.launch(_apply_fixed_mask_f64_kernel, dim=n_nodes, inputs=[lvl0.fixed_mask_dev, p_dev], device=used_device)
+
+                _launch_matvec_f64(
+                    lvl0.color_cells_dev,
+                    lvl0.brick_nodes_dev,
+                    lvl0.brick_payload_dev,
+                    ke_l0_f64_dev,
+                    flag_lut_f64_dev,
+                    lvl0.fixed_mask_dev,
+                    n_nodes,
+                    p_dev,
+                    q_dev,
+                    used_device,
+                    apply_fixed_mask=True,
+                )
+                delta_i = _gpu_dot_f64(p_dev, q_dev, scratch_256, used_device)
+                pr = _gpu_dot_f64(p_dev, r64_dev, scratch_256, used_device)
+                if not math.isfinite(delta_i) or delta_i <= 0.0 or pr <= 0.0:
+                    fcg_hist.clear()
+                    wp.launch(
+                        _scale_f32_to_f64_masked_kernel,
+                        dim=n_dofs,
+                        inputs=[np.float64(r_norm), lvl0.fixed_mask_dev, cg_x, p_dev],
+                        device=used_device,
+                    )
+                    _launch_matvec_f64(
+                        lvl0.color_cells_dev,
+                        lvl0.brick_nodes_dev,
+                        lvl0.brick_payload_dev,
+                        ke_l0_f64_dev,
+                        flag_lut_f64_dev,
+                        lvl0.fixed_mask_dev,
+                        n_nodes,
+                        p_dev,
+                        q_dev,
+                        used_device,
+                        apply_fixed_mask=True,
+                    )
+                    delta_i = _gpu_dot_f64(p_dev, q_dev, scratch_256, used_device)
+                    pr = _gpu_dot_f64(p_dev, r64_dev, scratch_256, used_device)
+                    if not math.isfinite(delta_i) or delta_i <= 0.0 or pr <= 0.0:
+                        del p_dev, q_dev
+                        break
+
+                alpha64 = np.float64(pr / delta_i)
+                wp.launch(_axpby_f64_kernel, dim=n_dofs, inputs=[np.float64(1.0), u64_dev, alpha64, p_dev, u64_dev], device=used_device)
+                wp.launch(_axpby_f64_kernel, dim=n_dofs, inputs=[np.float64(1.0), r64_dev, np.float64(-alpha64), q_dev, r64_dev], device=used_device)
+                fcg_hist.append((p_dev, q_dev, float(delta_i)))
+
+                r_norm = math.sqrt(max(_gpu_dot_f64(r64_dev, r64_dev, scratch_256, used_device), 0.0))
+                rel_res = r_norm / f_norm
+                if (outer_iters % 6 == 0) or (rel_res <= rtol):
+                    _launch_matvec_f64(
+                        lvl0.color_cells_dev,
+                        lvl0.brick_nodes_dev,
+                        lvl0.brick_payload_dev,
+                        ke_l0_f64_dev,
+                        flag_lut_f64_dev,
+                        lvl0.fixed_mask_dev,
+                        n_nodes,
+                        u64_dev,
+                        y64_dev,
+                        used_device,
+                        apply_fixed_mask=True,
+                    )
+                    wp.launch(_axpby_f64_kernel, dim=n_dofs, inputs=[np.float64(1.0), f64_dev, np.float64(-1.0), y64_dev, r64_dev], device=used_device)
+                    wp.launch(_apply_fixed_mask_f64_kernel, dim=n_nodes, inputs=[lvl0.fixed_mask_dev, r64_dev], device=used_device)
+                    r_norm = math.sqrt(max(_gpu_dot_f64(r64_dev, r64_dev, scratch_256, used_device), 0.0))
+                    rel_res = r_norm / f_norm
+                residual_history.append(rel_res)
+                if rel_res <= rtol:
+                    break
+
+            u_64_host = u64_dev.numpy()
+            del fcg_hist, f64_dev, r64_dev
 
     solve_seconds = time.perf_counter() - t_solve
 
@@ -1266,6 +1549,7 @@ def solve_hex_gpu(
         lvl0.brick_nodes_dev,
         lvl0.brick_payload_dev,
         ke_l0_f64_dev,
+        flag_lut_f64_dev,
         lvl0.fixed_mask_dev,
         n_nodes,
         u64_dev,
@@ -1324,7 +1608,7 @@ def solve_hex_gpu(
     ]
 
     # Free GPU solver buffers before streaming stress recovery so VRAM stays minimal.
-    del levels, lvl0, cg_x, cg_r, cg_p, cg_ap, cg_z, cg_d_tmp, scratch_256, u64_dev, y64_dev, ke_l0_f64_dev
+    del levels, lvl0, cg_x, cg_r, cg_p, cg_ap, cg_z, cg_d_tmp, scratch_256, u64_dev, y64_dev, ke_l0_f64_dev, flag_lut_f64_dev
     if "cg_v_r" in locals():
         del cg_v_r
     if used_device.startswith("cuda"):
@@ -1359,6 +1643,7 @@ def solve_hex_gpu(
         "reaction_N": reaction_sum.tolist(),
         "regions": quad_area_stats,
         "bounds_mm": [bbox_min, bbox_max],
+        "interface_config": interface_cfg.to_dict(),
         "process_rss_mib": rss_mib,
         "vram_reported_mib": vram_used_mib,
         "vram_peak_mib": vram_peak_mib,
@@ -1383,6 +1668,7 @@ def recover_stress_streaming(
     brick_nodes,
     displacement,
     material=None,
+    interface_cfg: HexInterfaceConfig = None,
     build_axis="Z",
     chunk_bricks=8192,
     spill_path=None,
@@ -1390,7 +1676,10 @@ def recover_stress_streaming(
     """Stream active bricks in bounded chunks to compute centroid orthotropic stresses and hotspots."""
     t0 = time.perf_counter()
     material = material or Material()
-    D_local = local_stiffness(material)
+    interface_cfg = interface_cfg or HexInterfaceConfig()
+    eff_material = interface_cfg.effective_material(material)
+    flag_lut = interface_cfg.flag_scale_lut()
+    D_local = local_stiffness(eff_material)
     dx, dy, dz = (float(x) for x in grid.pitch)
     _, B0 = hex_B_matrices(dx, dy, dz)
     n_bins = int(grid.meta.get("n_angle_bins", 360))
@@ -1398,10 +1687,12 @@ def recover_stress_streaming(
 
     n_vox = grid.num_voxels
     vm_all = np.empty(n_vox, dtype=np.float32)
+    vm_unscaled_all = np.empty(n_vox, dtype=np.float32)
     s_along_all = np.empty(n_vox, dtype=np.float32)
     s_layer_all = np.empty(n_vox, dtype=np.float32)
     shear_z_all = np.empty(n_vox, dtype=np.float32)
     feat_all = np.empty(n_vox, dtype=np.uint8)
+    flags_all = np.empty(n_vox, dtype=np.uint8)
 
     # Track global top-20 von Mises & top-20 interlayer normal stress hotspots
     top_k = 20
@@ -1445,23 +1736,26 @@ def recover_stress_streaming(
             abin, _, flags = unpack_payload(p_ch)
             angles = bin_to_angle(abin, n_bins)
             feats = decode_feature(flags).astype(np.uint8)
+            fscale = flag_lut[(flags >> 5) & 7]
 
             local_s, global_s = hex_centroid_stress(u_e, D_local, B0, angles, build_axis=build_axis)
             sx, sy, sz, txy, tyz, txz = global_s.T
-            vm = np.sqrt(0.5 * ((sx - sy) ** 2 + (sy - sz) ** 2 + (sz - sx) ** 2) + 3.0 * (txy * txy + tyz * tyz + txz * txz))
+            vm_raw = np.sqrt(0.5 * ((sx - sy) ** 2 + (sy - sz) ** 2 + (sz - sx) ** 2) + 3.0 * (txy * txy + tyz * tyz + txz * txz))
             shear_z = np.hypot(local_s[:, 4], local_s[:, 5])
 
-            vm_32 = vm.astype(np.float32)
-            sa_32 = local_s[:, 0].astype(np.float32)
-            st_32 = local_s[:, 1].astype(np.float32)
-            sl_32 = local_s[:, 2].astype(np.float32)
-            sh_32 = shear_z.astype(np.float32)
+            vm_32 = (vm_raw * fscale).astype(np.float32)
+            sa_32 = (local_s[:, 0] * fscale).astype(np.float32)
+            st_32 = (local_s[:, 1] * fscale).astype(np.float32)
+            sl_32 = (local_s[:, 2] * fscale).astype(np.float32)
+            sh_32 = (shear_z * fscale).astype(np.float32)
 
             vm_all[write_pos : write_pos + m] = vm_32
+            vm_unscaled_all[write_pos : write_pos + m] = vm_raw.astype(np.float32)
             s_along_all[write_pos : write_pos + m] = sa_32
             s_layer_all[write_pos : write_pos + m] = sl_32
             shear_z_all[write_pos : write_pos + m] = sh_32
             feat_all[write_pos : write_pos + m] = feats
+            flags_all[write_pos : write_pos + m] = flags.astype(np.uint8)
             write_pos += m
 
             if spill_fh is not None:
@@ -1503,6 +1797,25 @@ def recover_stress_streaming(
             "interlayer_shear_max_MPa": float(shear_z_all[msk].max()),
         }
 
+    m_seam = (flags_all & FLAG_SEAM_LOOP) != 0
+    m_ss = (flags_all & FLAG_START_STOP_ZONE) != 0
+    m_iface = (flags_all & FLAG_BEAD_INTERFACE) != 0
+    m_interior = ~(m_seam | m_ss | m_iface)
+    by_zone = {}
+    for zname, zmask in (
+        ("seam_loop", m_seam),
+        ("start_stop_zone", m_ss),
+        ("bead_interface", m_iface),
+        ("interior", m_interior),
+    ):
+        if zmask.any():
+            by_zone[zname] = {
+                "voxels": int(zmask.sum()),
+                "von_mises_max_MPa": float(vm_all[zmask].max()),
+                "von_mises_p95_MPa": float(np.percentile(vm_all[zmask], 95)),
+                "strain_equiv_vm_max_MPa": float(vm_unscaled_all[zmask].max()),
+            }
+
     return {
         "voxel_count": int(write_pos),
         "von_mises_max_MPa": float(vm_all.max()),
@@ -1514,6 +1827,7 @@ def recover_stress_streaming(
         "interlayer_shear_max_MPa": float(shear_z_all.max()),
         "interlayer_shear_p95_MPa": float(np.percentile(shear_z_all, 95)),
         "by_feature": by_feature,
+        "by_zone": by_zone,
         "top_von_mises_hotspots": [{"stress_MPa": v, "xyz_mm": c, "feature": f} for v, c, f in top_vm],
         "top_interlayer_tension_hotspots": [{"sigma_layer_MPa": v, "xyz_mm": c, "feature": f} for v, c, f in top_sz],
         "recovery_seconds": time.perf_counter() - t0,

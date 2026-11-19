@@ -1,4 +1,5 @@
 """Spawned numerical worker. No GUI imports; never write to stdout."""
+import gc
 import hashlib
 import html
 import json
@@ -22,16 +23,61 @@ def validate_case(cfg,base):
     if not isinstance(cfg,dict):raise JobError('INVALID_CASE','工况必须为 JSON 对象')
     allowed={'stl','size','pitch','gcode','offset','angle','build_axis','material','fixed','loaded','force',
              'mesh_mode','snap_tolerance','solver','rtol','maxiter','chunk_size','load_point','surface_remesh_mm',
-             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode','tetgen_radius_edge','max_elements','tetwild_stop_energy','tetwild_max_iterations','tetwild_quality_policy','refinement_strategy'}
+             'tetra_backend','surface_tolerance_mm','mesh_cache_dir','tetwild_mode','tetgen_radius_edge','max_elements','tetwild_stop_energy','tetwild_max_iterations','tetwild_quality_policy','refinement_strategy',
+             'engine','device','toolpath_pitch_mm','toolpath_dz_mm','toolpath_max_seg_len_mm','toolpath_cache_path','spill_stress','keep_largest_component','seam_config','strength_config','hex_interface_config'}
     if set(cfg)-allowed:raise JobError('INVALID_CASE',f'未知工况字段：{sorted(set(cfg)-allowed)}')
     cfg={'stl':'','size':[40,12,8],'pitch':DEFAULT_PITCH_MM,'gcode':'','offset':[0,0,0],'angle':0,
          'build_axis':'Z','material':{},'fixed':'X-','loaded':'X+','force':[0,0,-10],
          'mesh_mode':DEFAULT_MESH_MODE,'snap_tolerance':.0001,'surface_remesh_mm':0,'solver':'auto','rtol':1e-9,'maxiter':2000,'chunk_size':4096,
-         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'','tetgen_radius_edge':1.4,'max_elements':600000,'tetwild_stop_energy':None,'tetwild_max_iterations':80,'tetwild_quality_policy':'target','refinement_strategy':'independent',**cfg}
+         'tetra_backend':'tetgen','tetwild_mode':'modern','surface_tolerance_mm':.005,'mesh_cache_dir':'','tetgen_radius_edge':1.4,'max_elements':600000,'tetwild_stop_energy':None,'tetwild_max_iterations':80,'tetwild_quality_policy':'target','refinement_strategy':'independent',
+         'engine':'auto','device':'auto','toolpath_pitch_mm':0.2,'toolpath_dz_mm':None,'toolpath_max_seg_len_mm':1.0,'toolpath_cache_path':'','spill_stress':False,'keep_largest_component':True,'seam_config':None,'strength_config':None,'hex_interface_config':None,**cfg}
     def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
     for key in ('pitch','angle'):
         if not number(cfg[key]):raise JobError('INVALID_CASE',f'{key} 必须为有限数值')
     if cfg['pitch']<=0:raise JobError('INVALID_CASE','pitch 必须大于零')
+    if cfg['engine'] not in ('auto','toolpath_graph','toolpath_hex','legacy_solid'):
+        raise JobError('INVALID_CASE','engine 必须为 auto/toolpath_graph/toolpath_hex/legacy_solid')
+    if cfg['device'] not in ('auto','cuda:0','cpu'):
+        raise JobError('INVALID_CASE','device 必须为 auto/cuda:0/cpu')
+    if not number(cfg['toolpath_pitch_mm']) or not 0.05<=cfg['toolpath_pitch_mm']<=2.0:
+        raise JobError('INVALID_CASE','toolpath_pitch_mm 范围为 0.05–2.0 mm')
+    if cfg['toolpath_dz_mm'] is not None and (not number(cfg['toolpath_dz_mm']) or not 0.05<=cfg['toolpath_dz_mm']<=2.0):
+        raise JobError('INVALID_CASE','toolpath_dz_mm 范围为 0.05–2.0 mm 或 null')
+    if not number(cfg['toolpath_max_seg_len_mm']) or not 0.1<=cfg['toolpath_max_seg_len_mm']<=5.0:
+        raise JobError('INVALID_CASE','toolpath_max_seg_len_mm 范围为 0.1–5.0 mm')
+    for bkey in ('spill_stress','keep_largest_component'):
+        if not isinstance(cfg[bkey],bool):raise JobError('INVALID_CASE',f'{bkey} 必须为布尔值')
+    if not isinstance(cfg['toolpath_cache_path'],str):raise JobError('INVALID_CASE','toolpath_cache_path 必须为字符串')
+    if cfg['toolpath_cache_path']:
+        p=Path(cfg['toolpath_cache_path']);cfg['toolpath_cache_path']=str((p if p.is_absolute() else Path(base)/p).resolve())
+    _seam_keys={'ideal','seam_stiffness_factor','scarf_seam_stiffness_factor','start_anchor_factor','stop_anchor_factor',
+                'start_zone_beam_factor','stop_zone_beam_factor','lateral_weld_factor','interlayer_weld_factor',
+                'thermal_decay_tau_s','thermal_min_factor','beam_calibration_factor','bond_calibration_factor'}
+    if cfg['seam_config'] is not None:
+        sc=cfg['seam_config']
+        if not isinstance(sc,dict) or (set(sc)-_seam_keys):raise JobError('INVALID_CASE','seam_config 字段无效')
+        for k,v in sc.items():
+            if k=='ideal':
+                if not isinstance(v,bool):raise JobError('INVALID_CASE','seam_config.ideal 必须为布尔值')
+            elif not number(v) or (v<0 if k=='thermal_decay_tau_s' else v<=0):
+                raise JobError('INVALID_CASE',f'seam_config.{k} 数值无效')
+    _str_keys={'sigma_beam_allow_MPa','sigma_interlayer_allow_MPa','tau_interlayer_allow_MPa','sigma_lateral_allow_MPa','tau_lateral_allow_MPa','strength_scale_exponent'}
+    if cfg['strength_config'] is not None:
+        st=cfg['strength_config']
+        if not isinstance(st,dict) or (set(st)-_str_keys):raise JobError('INVALID_CASE','strength_config 字段无效')
+        for k,v in st.items():
+            if not number(v):raise JobError('INVALID_CASE',f'strength_config.{k} 必须为有限数值')
+            if k=='strength_scale_exponent' and not 0.0<=v<=3.0:raise JobError('INVALID_CASE','strength_scale_exponent 范围为 0–3')
+            if k!='strength_scale_exponent' and v<=0:raise JobError('INVALID_CASE',f'strength_config.{k} 必须大于零')
+    _hex_keys={'weakened','seam_factor','start_stop_factor','bead_interface_factor','interlayer_shear_factor'}
+    if cfg['hex_interface_config'] is not None:
+        hc=cfg['hex_interface_config']
+        if not isinstance(hc,dict) or (set(hc)-_hex_keys):raise JobError('INVALID_CASE','hex_interface_config 字段无效')
+        for k,v in hc.items():
+            if k=='weakened':
+                if not isinstance(v,bool):raise JobError('INVALID_CASE','hex_interface_config.weakened 必须为布尔值')
+            elif not number(v) or v<=0:
+                raise JobError('INVALID_CASE',f'hex_interface_config.{k} 必须大于零')
     if cfg['mesh_mode'] not in ('voxel','tetra'):raise JobError('INVALID_CASE','mesh_mode 必须为 voxel/tetra')
     if cfg['tetra_backend'] not in ('tetgen','tetwild'):raise JobError('INVALID_CASE','tetra_backend 必须为 tetgen/tetwild')
     if not number(cfg['tetgen_radius_edge']) or not 1.2<=cfg['tetgen_radius_edge']<=3:raise JobError('INVALID_CASE','tetgen_radius_edge 范围为 1.2–3')
@@ -89,7 +135,22 @@ def validate_case(cfg,base):
             if not path.is_file():raise JobError('INPUT_NOT_FOUND',f'{key}: {path}')
             cfg[key]=str(path.resolve())
     if cfg['gcode'] and cfg['build_axis']!='Z':raise JobError('INVALID_CASE','G-code 模式要求 build_axis=Z')
+    if cfg['engine'] in ('toolpath_graph','toolpath_hex') and not cfg['gcode']:
+        raise JobError('INVALID_CASE',f"engine={cfg['engine']} 必须提供 gcode")
     return cfg
+
+
+def resolve_engine(cfg,options):
+    req=options.get('engine') or cfg.get('engine','auto')
+    if req not in ('auto','toolpath_graph','toolpath_hex','legacy_solid'):
+        raise JobError('INVALID_CASE',f'无效求解引擎：{req}')
+    resolved='toolpath_graph' if (req=='auto' and cfg.get('gcode') and not options.get('angles')) else ('legacy_solid' if req=='auto' else req)
+    if resolved in ('toolpath_graph','toolpath_hex'):
+        if not cfg.get('gcode'):
+            raise JobError('INVALID_CASE',f'engine={resolved} 必须提供 gcode')
+        if options.get('angles'):
+            raise JobError('INVALID_CASE',f'engine={resolved} 不能与 angles 同时使用')
+    return req,resolved
 
 
 def check(code,status,message,**metrics):
@@ -225,6 +286,268 @@ def write_report(path,summary):
     Path(path).write_text(content,encoding='utf-8')
 
 
+def _write_toolpath_report(path,summary):
+    m=summary['metrics']
+    checks=''.join(f"<li><b>{html.escape(c['code'])} [{c['status']}]</b> {html.escape(c['message'])}<pre>{html.escape(json.dumps(c['metrics'],ensure_ascii=False,indent=2))}</pre></li>" for c in summary['checks'])
+    sa=m.get('safety_audit')
+    sa_block=f"<h2>失效指数与安全系数（未标定参考基准）</h2><pre>{html.escape(json.dumps(sa,ensure_ascii=False,indent=2))}</pre>" if sa else ''
+    content=f'''<!doctype html><html lang="zh"><meta charset="utf-8"><title>PathFEA Toolpath Analysis Report</title>
+<style>body{{font:16px system-ui;max-width:1100px;margin:40px auto;padding:20px;color:#213547}}table{{border-collapse:collapse;width:100%}}td,th{{padding:10px;border:1px solid #ccc}}img{{width:100%}}pre{{white-space:pre-wrap;background:#f4f6f8;padding:12px}}</style>
+<h1>PathFEA 走线级仿真报告（{html.escape(summary['engine'])}）</h1>
+<p>数值筛查状态：{html.escape(summary['quality'])}。线弹性小变形模型；默认基准强度仅用于数值筛查，不证明实际安全承载。</p>
+<img src="preview.png" alt="走线级仿真结果预览">
+<h2>关键指标</h2>
+<table><tr><th>引擎</th><th>节点</th><th>单元/边</th><th>最大位移 mm</th><th>功共轭位移 mm</th><th>峰值应力 MPa</th><th>残差</th></tr>
+<tr><td>{html.escape(summary['engine'])}</td><td>{m['nodes']}</td><td>{m['elements']}</td><td>{m['max_displacement_mm']:.6g}</td><td>{m.get('work_conjugate_displacement_mm')}</td><td>{m['max_von_mises_MPa']:.6g}</td><td>{m['relative_residual']:.3e}</td></tr></table>
+{sa_block}
+<h2>自动校核</h2><ul>{checks}</ul>
+<h2>输入工况</h2><pre>{html.escape(json.dumps(summary['settings'],ensure_ascii=False,indent=2))}</pre></html>'''
+    Path(path).write_text(content,encoding='utf-8')
+
+
+def _run_toolpath_graph_worker(cfg,inputs,out,options,req_engine,emit):
+    from beam_bond_solver import recover_graph_stress_streaming,solve_toolpath_graph_gpu
+    from run_toolpath_graph import render_graph_preview
+    from toolpath_graph import SeamConfig,StrengthConfig,gcode_to_toolpath_graph,load_toolpath_graph
+
+    device=options.get('device') or cfg.get('device','auto')
+    max_seg=float(cfg['toolpath_max_seg_len_mm'])
+    seam_cfg=SeamConfig.from_dict(cfg.get('seam_config'))
+    strength_cfg=StrengthConfig.from_dict(cfg.get('strength_config'))
+    cache_p=Path(cfg['toolpath_cache_path']) if cfg['toolpath_cache_path'] else (out/'model.tgraph')
+
+    emit('gcode_read')
+    graph=None
+    if cache_p.is_file():
+        try:
+            cand=load_toolpath_graph(cache_p,verify_checksum=True)
+            if cand.meta.get('source_gcode')==cfg['gcode'] and abs(float(cand.meta.get('max_seg_len_mm',-1.0))-max_seg)<1e-9:
+                graph=cand
+        except Exception:
+            graph=None
+    cache_hit=graph is not None
+    if graph is None:
+        graph=gcode_to_toolpath_graph(
+            cfg['gcode'],
+            out_graph_path=cache_p,
+            offset=tuple(cfg['offset']),
+            max_seg_len=max_seg,
+            keep_largest_component=bool(cfg['keep_largest_component']),
+        )
+        gc.collect()
+
+    eff_rtol=max(float(cfg['rtol']),1e-7)
+    material=Material(**cfg['material'])
+    emit('base.linear_solve')
+    res=solve_toolpath_graph_gpu(
+        graph,
+        material=material,
+        seam_cfg=seam_cfg,
+        fixed=cfg['fixed'],
+        loaded=cfg['loaded'],
+        force=cfg['force'],
+        load_point=cfg.get('load_point'),
+        rtol=eff_rtol,
+        device=device,
+    )
+    res['solver_info']['requested_rtol']=cfg['rtol']
+    res['solver_info']['effective_rtol']=eff_rtol
+
+    emit('base.postprocess')
+    spill_file=(out/'graph_stress.bin') if cfg['spill_stress'] else None
+    stress_sum=recover_graph_stress_streaming(
+        graph,
+        res['displacement_6dof'],
+        material=material,
+        seam_cfg=seam_cfg,
+        strength_cfg=strength_cfg,
+        spill_path=spill_file,
+    )
+    stress_json={k:v for k,v in stress_sum.items() if not k.startswith('_')}
+
+    emit('checks')
+    si=res['solver_info']
+    conn=graph.meta['connectivity']
+    extent=float(np.ptp(graph.node_xyz,axis=0).max())
+    small_ratio=float(si['max_displacement_mm']/max(extent,1e-12))
+    checks=[
+        check('EQUILIBRIUM','pass' if max(si['force_relative_error'],si['moment_relative_error'],si['relative_residual'])<1e-6 else 'warn',
+              '力及 6-DOF 力矩平衡与原始 fp64 残差检查',
+              force_relative_error=si['force_relative_error'],moment_relative_error=si['moment_relative_error'],residual=si['relative_residual']),
+        check('CONNECTIVITY','pass' if conn['dropped_components']==0 else 'warn',
+              '走线网络连通性检查',**conn),
+        check('SMALL_DISPLACEMENT','warn' if small_ratio>0.05 else 'pass',
+              '最大位移/包围盒长度筛查，不替代局部应变和几何非线性判定',ratio=small_ratio),
+        check('SEAM_START_STOP_AUDIT','pass',
+              '显式 Z-seam、围巾接缝、起停锚点与热冷却统计',
+              bond_counts=graph.meta['bond_counts'],retracted_starts=graph.meta['beads_summary']['retracted_starts'],
+              safety_audit=stress_json['safety_audit']),
+        check('TOOLPATH_MODEL_SCOPE','warn',
+              '走线级线弹性网络筛查；默认接触强度基准尚未针对具体耗材与工艺标定，不含渐进脆断或非线性接触',
+              graph_cache_hit=cache_hit,device=si['device']),
+    ]
+
+    metrics_dict={
+        'nodes':si['nodes'],
+        'elements':si['beams']+si['bonds'],
+        'beams':si['beams'],
+        'bonds':si['bonds'],
+        'strain_energy_Nmm':si['strain_energy_Nmm'],
+        'work_conjugate_displacement_mm':si['work_conjugate_displacement_mm'],
+        'compliance_mm_per_N':si['compliance_mm_per_N'],
+        'max_displacement_mm':si['max_displacement_mm'],
+        'stress_p95_MPa':stress_json['beam_von_mises_p95_MPa'],
+        'max_von_mises_MPa':stress_json['beam_von_mises_max_MPa'],
+        'reaction_N':si['reaction_N'],
+        'relative_residual':si['relative_residual'],
+        'solver':si,
+        'graph':graph.meta,
+        'stress':stress_json,
+        'safety_audit':stress_json['safety_audit'],
+    }
+    runs=[dict(name='base',pitch=max_seg,angle=cfg['angle'],metrics=metrics_dict)]
+    summary=dict(
+        settings=cfg,inputs=inputs,units='mm,N,MPa',
+        engine='toolpath_graph',requested_engine=req_engine,
+        metrics=metrics_dict,checks=checks,checks_scope='base_case_only',runs=runs,
+        quality='needs_review' if any(c['status'] in ('warn','not_checked') for c in checks) else 'numerical_checks_passed',
+        scope='numerical_screening_only',
+    )
+
+    emit('render')
+    render_graph_preview(graph,res,stress_sum,out/'preview.png')
+    _write_toolpath_report(out/'report.html',summary)
+    (out/'analysis.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
+    return summary
+
+
+def _run_toolpath_hex_worker(cfg,inputs,out,options,req_engine,emit):
+    from gpu_hex_solver import HexInterfaceConfig,recover_stress_streaming,solve_hex_gpu
+    from run_toolpath_gpu import render_2d_projection_preview
+    from toolpath_bricks import gcode_to_bricks,load_bricks
+
+    device=options.get('device') or cfg.get('device','auto')
+    pitch=float(cfg['toolpath_pitch_mm'])
+    dz=cfg.get('toolpath_dz_mm')
+    dz_val=pitch if dz is None else float(dz)
+    icfg=HexInterfaceConfig.from_dict(cfg.get('hex_interface_config'))
+    cache_p=Path(cfg['toolpath_cache_path']) if cfg['toolpath_cache_path'] else (out/'model.tbricks')
+
+    emit('gcode_read')
+    grid=None
+    need_v2=icfg.is_weakened()
+    if cache_p.is_file():
+        try:
+            cand=load_bricks(cache_p,verify_checksum=True)
+            cp=cand.meta.get('pitch_mm',[])
+            ver_ok=(not need_v2) or (int(cand.meta.get('flags_version',1))>=2)
+            if ver_ok and len(cp)==3 and abs(cp[0]-pitch)<1e-9 and abs(cp[2]-dz_val)<1e-9 and cand.meta.get('source_gcode')==cfg['gcode']:
+                grid=cand
+        except Exception:
+            grid=None
+    cache_hit=grid is not None
+    if grid is None:
+        grid=gcode_to_bricks(
+            cfg['gcode'],
+            out_bricks_path=cache_p,
+            pitch=pitch,
+            dz=dz,
+            offset=tuple(cfg['offset']),
+            keep_largest_component=bool(cfg['keep_largest_component']),
+            device=device,
+        )
+
+    eff_rtol=max(float(cfg['rtol']),1e-7)
+    material=Material(**cfg['material'])
+    res=solve_hex_gpu(
+        grid,
+        material=material,
+        interface_cfg=icfg,
+        fixed=cfg['fixed'],
+        loaded=cfg['loaded'],
+        force=cfg['force'],
+        load_point=cfg.get('load_point'),
+        build_axis=cfg['build_axis'],
+        rtol=eff_rtol,
+        max_levels=6,
+        coarse_dof_target=12000,
+        device=device,
+        progress=lambda s:emit('base.'+s),
+    )
+    res['solver_info']['requested_rtol']=cfg['rtol']
+    res['solver_info']['effective_rtol']=eff_rtol
+
+    emit('base.postprocess')
+    spill_file=(out/'stress_fields.bin') if cfg['spill_stress'] else None
+    stress_sum=recover_stress_streaming(
+        grid,
+        res['brick_nodes'],
+        res['displacement'],
+        material=material,
+        interface_cfg=icfg,
+        build_axis=cfg['build_axis'],
+        spill_path=spill_file,
+    )
+    stress_json={k:v for k,v in stress_sum.items() if not k.startswith('_')}
+
+    emit('checks')
+    si=res['solver_info']
+    conn=grid.meta['connectivity']
+    bmin,bmax=si['bounds_mm']
+    extent=float(np.max(np.array(bmax)-np.array(bmin)))
+    small_ratio=float(si['max_displacement_mm']/max(extent,1e-12))
+    checks=[
+        check('EQUILIBRIUM','pass' if max(si['force_relative_error'],si['moment_relative_error'],si['relative_residual'])<1e-6 else 'warn',
+              '力及力矩平衡与原始 fp64 残差检查',
+              force_relative_error=si['force_relative_error'],moment_relative_error=si['moment_relative_error'],residual=si['relative_residual']),
+        check('CONNECTIVITY','pass' if conn['dropped_components']==0 else 'warn',
+              '体素砖块 6-邻域面连通性检查',**conn),
+        check('SMALL_DISPLACEMENT','warn' if small_ratio>0.05 else 'pass',
+              '最大位移/包围盒长度筛查，不替代局部应变和几何非线性判定',ratio=small_ratio),
+        check('HEX_INTERFACE_AUDIT','pass',
+              '0.2 mm H8 走线界面与启停区标志统计',
+              flags_version=grid.meta.get('flags_version',1),
+              start_stop_voxels=grid.meta.get('start_stop_voxel_count',0),
+              bead_interface_voxels=grid.meta.get('bead_interface_voxel_count',0),
+              seam_loop_voxels=grid.meta.get('seam_loop_voxel_count',0),
+              interface_config=si['interface_config']),
+        check('TOOLPATH_MODEL_SCOPE','warn',
+              '0.2 mm 走线体素线弹性筛查；材料与界面折减因子需实验标定，不含非线性断裂或接触',
+              bricks_cache_hit=cache_hit,device=si['device']),
+    ]
+
+    metrics_dict={
+        'nodes':si['nodes'],
+        'elements':si['elements'],
+        'strain_energy_Nmm':si['strain_energy_Nmm'],
+        'work_conjugate_displacement_mm':si['work_conjugate_displacement_mm'],
+        'compliance_mm_per_N':si['compliance_mm_per_N'],
+        'max_displacement_mm':si['max_displacement_mm'],
+        'stress_p95_MPa':stress_json['von_mises_p95_MPa'],
+        'max_von_mises_MPa':stress_json['von_mises_max_MPa'],
+        'reaction_N':si['reaction_N'],
+        'relative_residual':si['relative_residual'],
+        'volume_mm3':grid.meta['rasterized_volume_mm3'],
+        'solver':si,
+        'mesh':grid.meta,
+        'stress':stress_json,
+    }
+    runs=[dict(name='base',pitch=pitch,angle=cfg['angle'],metrics=metrics_dict)]
+    summary=dict(
+        settings=cfg,inputs=inputs,units='mm,N,MPa',
+        engine='toolpath_hex',requested_engine=req_engine,
+        metrics=metrics_dict,checks=checks,checks_scope='base_case_only',runs=runs,
+        quality='needs_review' if any(c['status'] in ('warn','not_checked') for c in checks) else 'numerical_checks_passed',
+        scope='numerical_screening_only',
+    )
+
+    emit('render')
+    render_2d_projection_preview(grid,res,stress_sum,out/'preview.png')
+    _write_toolpath_report(out/'report.html',summary)
+    (out/'analysis.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
+    return summary
+
+
 def worker_main(queue,cfg,base,directory,options):
     stage='validation'
     def emit(value):
@@ -232,6 +555,7 @@ def worker_main(queue,cfg,base,directory,options):
         stage=value;queue.put({'type':'progress','stage':value,'time':time.time()})
     try:
         emit('validation');cfg=validate_case(cfg,base);out=Path(directory)
+        req_engine,resolved_engine=resolve_engine(cfg,options)
         # Hash inputs before computation for reproducibility. Files must remain unchanged during a run.
         inputs={}
         for key in ('stl','gcode'):
@@ -240,6 +564,14 @@ def worker_main(queue,cfg,base,directory,options):
                 with open(cfg[key],'rb') as source:
                     for block in iter(lambda:source.read(1024*1024),b''):digest.update(block)
                 inputs[key]={'path':cfg[key],'sha256':digest.hexdigest()}
+        if resolved_engine=='toolpath_graph':
+            summary=_run_toolpath_graph_worker(cfg,inputs,out,options,req_engine,emit)
+            queue.put({'type':'complete','summary':summary})
+            return
+        if resolved_engine=='toolpath_hex':
+            summary=_run_toolpath_hex_worker(cfg,inputs,out,options,req_engine,emit)
+            queue.put({'type':'complete','summary':summary})
+            return
         emit('gcode_read');segments=read_gcode(cfg['gcode']) if cfg['gcode'] else None
         mesh_cache={}
         def compute(case,label,parent=None):
@@ -305,7 +637,8 @@ def worker_main(queue,cfg,base,directory,options):
                 runs.append(dict(name=f'angle_{i}',pitch=case['pitch'],angle=angle,metrics=metrics(result)))
                 write_npz(out/f'angle_{i}.npz',result);del result
         emit('export');write_vtk(out/'result.vtk',r);write_npz(out/'result.npz',r)
-        summary=dict(settings=cfg,inputs=inputs,units='mm,N,MPa',metrics=metrics(r),checks=checks,checks_scope='base_and_available_refined_cases',runs=runs,
+        summary=dict(settings=cfg,inputs=inputs,units='mm,N,MPa',engine='legacy_solid',requested_engine=req_engine,
+                     metrics=metrics(r),checks=checks,checks_scope='base_and_available_refined_cases',runs=runs,
                      quality='needs_review' if any(c['status'] in ('warn','not_checked') for c in checks) else 'numerical_checks_passed',scope='numerical_screening_only')
         emit('render');render(r,out/'preview.png');write_report(out/'report.html',summary)
         (out/'analysis.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')

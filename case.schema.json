@@ -241,6 +241,96 @@
       "maximum": 0.015,
       "default": 0.005,
       "description": "TetWild surface envelope in mm; independent topology, volume and distance audits remain mandatory."
+    },
+    "engine": {
+      "type": "string",
+      "enum": ["auto", "toolpath_graph", "toolpath_hex", "legacy_solid"],
+      "default": "auto",
+      "description": "Solver engine selector: auto uses toolpath_graph when gcode is provided (no --angles), else legacy_solid."
+    },
+    "device": {
+      "type": "string",
+      "enum": ["auto", "cuda:0", "cpu"],
+      "default": "auto",
+      "description": "Warp compute backend for toolpath_graph and toolpath_hex."
+    },
+    "toolpath_pitch_mm": {
+      "type": "number",
+      "minimum": 0.05,
+      "maximum": 2.0,
+      "default": 0.2,
+      "description": "XY voxel pitch in mm for engine='toolpath_hex'."
+    },
+    "toolpath_dz_mm": {
+      "type": ["number", "null"],
+      "minimum": 0.05,
+      "maximum": 2.0,
+      "default": null,
+      "description": "Optional Z voxel pitch in mm for engine='toolpath_hex'; null uses toolpath_pitch_mm."
+    },
+    "toolpath_max_seg_len_mm": {
+      "type": "number",
+      "minimum": 0.1,
+      "maximum": 5.0,
+      "default": 1.0,
+      "description": "Max arc-length segment spacing in mm for engine='toolpath_graph'."
+    },
+    "toolpath_cache_path": {
+      "type": "string",
+      "default": "",
+      "description": "Optional .tgraph or .tbricks model cache path relative to case file."
+    },
+    "spill_stress": {
+      "type": "boolean",
+      "default": false,
+      "description": "Stream element stress binaries (graph_stress.bin / stress_fields.bin) into the run artifact directory."
+    },
+    "keep_largest_component": {
+      "type": "boolean",
+      "default": true,
+      "description": "Prune disconnected islands when building toolpath graph or brick grid."
+    },
+    "seam_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ideal": {"type": "boolean"},
+        "seam_stiffness_factor": {"type": "number", "exclusiveMinimum": 0},
+        "scarf_seam_stiffness_factor": {"type": "number", "exclusiveMinimum": 0},
+        "start_anchor_factor": {"type": "number", "exclusiveMinimum": 0},
+        "stop_anchor_factor": {"type": "number", "exclusiveMinimum": 0},
+        "start_zone_beam_factor": {"type": "number", "exclusiveMinimum": 0},
+        "stop_zone_beam_factor": {"type": "number", "exclusiveMinimum": 0},
+        "lateral_weld_factor": {"type": "number", "exclusiveMinimum": 0},
+        "interlayer_weld_factor": {"type": "number", "exclusiveMinimum": 0},
+        "thermal_decay_tau_s": {"type": "number", "minimum": 0},
+        "thermal_min_factor": {"type": "number", "exclusiveMinimum": 0},
+        "beam_calibration_factor": {"type": "number", "exclusiveMinimum": 0},
+        "bond_calibration_factor": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "strength_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sigma_beam_allow_MPa": {"type": "number", "exclusiveMinimum": 0},
+        "sigma_interlayer_allow_MPa": {"type": "number", "exclusiveMinimum": 0},
+        "tau_interlayer_allow_MPa": {"type": "number", "exclusiveMinimum": 0},
+        "sigma_lateral_allow_MPa": {"type": "number", "exclusiveMinimum": 0},
+        "tau_lateral_allow_MPa": {"type": "number", "exclusiveMinimum": 0},
+        "strength_scale_exponent": {"type": "number", "minimum": 0, "maximum": 3}
+      }
+    },
+    "hex_interface_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "weakened": {"type": "boolean"},
+        "seam_factor": {"type": "number", "exclusiveMinimum": 0},
+        "start_stop_factor": {"type": "number", "exclusiveMinimum": 0},
+        "bead_interface_factor": {"type": "number", "exclusiveMinimum": 0},
+        "interlayer_shear_factor": {"type": "number", "exclusiveMinimum": 0}
+      }
     }
   }
 }

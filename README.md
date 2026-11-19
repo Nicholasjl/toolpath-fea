@@ -8,22 +8,29 @@
 
 ```powershell
 python -m pip install -r requirements.txt
+# 可选 GPU / CPU 走线级求解加速（warp-lang）
+python -m pip install -r requirements-gpu.txt
 python run3d.py example_case.json --output output/example --timeout 300 --memory-mb 2048
 ```
 
 CLI 的 stdout 为单个 JSON，stderr 为进度事件。输出清单 `output/example.json` 中的 `artifacts` 指向本次报告、图片、NPZ 和 VTK；报告与图片需保存在同目录。默认例子是测试块，无需下载外部 STL。
 
-STL 默认采用质量四面体网格 `pq1.4Q`，允许边界细分；目标尺度从2mm起步，CLI和桌面均默认进行两档细化检查。实际体积网格未变细时，不会因位移接近而报告收敛通过。`voxel` 需显式选择。
+`run3d.py` 通过 `engine`（工况字段或 `--engine`）选择引擎，默认 `auto`：
+- 当工况提供 `gcode`（且未使用 `--angles`）时，默认自动启用 **`toolpath_graph`（6-DOF 走线丝束-焊缝网络）**，显式建模闭环 Z-seam / Scarf 接缝、开路径启停锚点、热冷却衰减与接头失效指数；
+- 可显式切换 **`toolpath_hex`**（`--engine toolpath_hex`，默认 `0.2 mm` 稀疏砖块 GPU 无矩阵多重网格六面体连续体 + 路线 2 界面标志弱化）；
+- 未提供 `gcode`（仅 STL 或测试块）或显式指定 `--engine legacy_solid` 时回落到传统贴体四面体/体素求解器（`tetra` 默认 `pq1.4Q` + 两档细化检查）。
+- 走线级双引擎默认 `--device auto`（有 NVIDIA 显卡使用 `cuda:0`，无独显自动通过 Warp LLVM 后端运行多线程 `cpu`）。
+
+独立直接入口（无需监控壳，支持大模型分批缓存）：`python run_toolpath_graph.py case.json` / `python run_toolpath_gpu.py case.json`。
 
 桌面界面：`python app3d.py`（Windows 可双击 `start3d.cmd`）。二维界面：`python app.py`。
 
 ## 三维能力
 
-- 四节点四面体，每节点三个平移自由度；局部正交各向异性本构。
-- STL 体素或贴体四面体网格，可选审计后的表面预处理；稀疏装配、直接法或 AMG/CG。
-- 按最近层与最近挤出线段映射材料方向，并报告路径覆盖距离。
-- 面/盒选固定和加载区域；远端 `load_point` 通过等效分布力及力矩表达偏置载荷。
-- CLI 支持多个分离盒区域（例如四个安装孔），显式可选 TetWild 稳健后端和带内容校验的网格缓存；安装及精度约束见 [Agent 接口](AGENT_API.md)。
+- **走线网络（`toolpath_graph`，有 G-code 时默认）**：流式双层滑窗构建 6-DOF Timoshenko 丝束梁 + 偏心界面耦合器，不合并闭环首尾而是显式保留 `seam_closed` / `seam_scarf` 与 `start_anchor` / `stop_anchor`，GPU 连通聚合多重网格 + 外层 `fp64` 截断 FCG，支持 `0.2 mm H8` 对标刚度校准、热冷却时间衰减与基准失效指数 / FoS 筛查。
+- **走线体素（`toolpath_hex`）**：两趟流式光栅化 + GPU `4×4` 子采样 -> `4×4×4` 稀疏砖块（`.tbricks`），8 色无矩阵多层多重网格 + 路线 2 启停/接缝/道间界面弱化，精确区分内部空隙与跨层换向。
+- **传统实体（`legacy_solid`）**：四节点四面体，每节点三个平移自由度；局部正交各向异性本构；STL 体素或贴体四面体网格（支持 TetGen / TetWild 与表面预处理）；按最近层与最近挤出线段映射材料方向。
+- 面/盒选（支持多安装孔 `boxes` 并集）固定和加载区域；远端 `load_point` 通过等效分布力及力矩表达偏置载荷。
 - 作业超时、进程内存监控、取消文件、输入哈希、数值诊断与报告。
 
 例如，板正面 Z=5 mm，挂点伸出正面 10 mm，1 kg 重物向下（-Y）的工况片段：

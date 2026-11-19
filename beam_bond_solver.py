@@ -1,5 +1,6 @@
 """GPU-accelerated 6-DOF BSR + Galerkin Connected-Aggregate Multigrid solver for toolpath graphs."""
 from dataclasses import dataclass
+import gc
 import math
 from pathlib import Path
 import time
@@ -30,6 +31,7 @@ from toolpath_graph import (
     NODE_START_ZONE,
     NODE_STOP_ZONE,
     SeamConfig,
+    StrengthConfig,
     ToolpathGraph,
 )
 
@@ -271,7 +273,7 @@ def _gpu_dot_f32(a, b, scratch_256, device):
     return float(scratch_256.numpy().sum())
 
 
-def _beam_scale_factors(beam_flags, seam_cfg: SeamConfig):
+def _beam_degradation_factors(beam_flags, seam_cfg: SeamConfig):
     sc = np.ones(len(beam_flags), dtype=np.float64)
     in_start = (beam_flags & NODE_START_ZONE) != 0
     in_stop = (beam_flags & NODE_STOP_ZONE) != 0
@@ -282,7 +284,11 @@ def _beam_scale_factors(beam_flags, seam_cfg: SeamConfig):
     return sc
 
 
-def _bond_scale_factors(bond_type, bond_dt, seam_cfg: SeamConfig):
+def _beam_scale_factors(beam_flags, seam_cfg: SeamConfig):
+    return _beam_degradation_factors(beam_flags, seam_cfg) * float(seam_cfg.beam_calibration_factor)
+
+
+def _bond_degradation_factors(bond_type, bond_dt, bond_normal, seam_cfg: SeamConfig):
     fac = np.ones(len(bond_type), dtype=np.float64)
     fac[bond_type == BOND_INTERLAYER] = seam_cfg.interlayer_weld_factor
     fac[bond_type == BOND_LATERAL] = seam_cfg.lateral_weld_factor
@@ -291,14 +297,25 @@ def _bond_scale_factors(bond_type, bond_dt, seam_cfg: SeamConfig):
     fac[bond_type == BOND_START_ANCHOR] = seam_cfg.start_anchor_factor
     fac[bond_type == BOND_STOP_ANCHOR] = seam_cfg.stop_anchor_factor
     if seam_cfg.thermal_decay_tau_s > 0.0:
-        inter = bond_type == BOND_INTERLAYER
-        if inter.any():
+        therm = bond_type == BOND_INTERLAYER
+        if bond_normal is not None:
+            vert_anchor = ((bond_type == BOND_START_ANCHOR) | (bond_type == BOND_STOP_ANCHOR)) & (
+                np.abs(bond_normal[:, 2]) > 0.5
+            ) & (bond_dt > 0.0)
+            therm = therm | vert_anchor
+        if therm.any():
             decay = np.maximum(
                 seam_cfg.thermal_min_factor,
-                np.exp(-np.maximum(bond_dt[inter], 0.0) / seam_cfg.thermal_decay_tau_s),
+                np.exp(-np.maximum(bond_dt[therm], 0.0) / seam_cfg.thermal_decay_tau_s),
             )
-            fac[inter] *= decay
+            fac[therm] *= decay
     return fac
+
+
+def _bond_scale_factors(bond_type, bond_dt, seam_cfg: SeamConfig, bond_normal=None):
+    return _bond_degradation_factors(bond_type, bond_dt, bond_normal, seam_cfg) * float(
+        seam_cfg.bond_calibration_factor
+    )
 
 
 def _bond_moduli(bond_type, material: Material):
@@ -416,7 +433,7 @@ def matvec_elements_f64(graph: ToolpathGraph, material: Material, seam_cfg: Seam
     # Bonds
     mk = graph.num_bonds
     if mk:
-        bond_fac = _bond_scale_factors(graph.bond_type, graph.bond_dt, seam_cfg)
+        bond_fac = _bond_scale_factors(graph.bond_type, graph.bond_dt, seam_cfg, graph.bond_normal)
         e_b, g1, g2 = _bond_moduli(graph.bond_type, material)
         for start in range(0, mk, chunk_size):
             stop = min(mk, start + chunk_size)
@@ -446,7 +463,7 @@ def matvec_elements_f64(graph: ToolpathGraph, material: Material, seam_cfg: Seam
     return y_nodes.ravel()
 
 
-def assemble_bsr6_f32(graph: ToolpathGraph, material: Material, seam_cfg: SeamConfig, fixed_mask_np, chunk_size=32768):
+def assemble_bsr6_f32(graph: ToolpathGraph, material: Material, seam_cfg: SeamConfig, fixed_mask_np, chunk_size=16384):
     """Assemble free-DOF 6x6 BSR matrix in float32 using bounded-memory chunks."""
     n = graph.num_nodes
     fixed_bool = fixed_mask_np != 0
@@ -504,7 +521,6 @@ def assemble_bsr6_f32(graph: ToolpathGraph, material: Material, seam_cfg: SeamCo
             np.add.at(data, p_ab, ke_f64[both, :6, 6:].reshape(-1, 36).astype(np.float32))
             np.add.at(data, p_ba, ke_f64[both, 6:, :6].reshape(-1, 36).astype(np.float32))
 
-    beam_sc = _beam_scale_factors(graph.beam_flags, seam_cfg)
     mb = graph.num_beams
     for start in range(0, mb, chunk_size):
         stop = min(mb, start + chunk_size)
@@ -515,17 +531,18 @@ def assemble_bsr6_f32(graph: ToolpathGraph, material: Material, seam_cfg: SeamCo
             graph.beam_w[start:stop],
             graph.beam_h[start:stop],
             material,
-            scale=beam_sc[start:stop],
+            scale=_beam_scale_factors(graph.beam_flags[start:stop], seam_cfg),
         )
         _scatter_elements(e, Ke)
 
     mk = graph.num_bonds
     if mk:
-        bond_fac = _bond_scale_factors(graph.bond_type, graph.bond_dt, seam_cfg)
-        e_b, g1, g2 = _bond_moduli(graph.bond_type, material)
         for start in range(0, mk, chunk_size):
             stop = min(mk, start + chunk_size)
             e = graph.bond_edges[start:stop]
+            b_type_c = graph.bond_type[start:stop]
+            bond_fac_c = _bond_scale_factors(b_type_c, graph.bond_dt[start:stop], seam_cfg, graph.bond_normal[start:stop])
+            e_b_c, g1_c, g2_c = _bond_moduli(b_type_c, material)
             geom = graph.bond_geom[start:stop].astype(np.float64)
             Ke = eccentric_bond_stiffness_batch(
                 graph.node_xyz[e[:, 0]],
@@ -538,19 +555,26 @@ def assemble_bsr6_f32(graph: ToolpathGraph, material: Material, seam_cfg: SeamCo
                 geom[:, 1],
                 geom[:, 2],
                 geom[:, 3],
-                e_b[start:stop],
-                g1[start:stop],
-                g2[start:stop],
-                factor=bond_fac[start:stop],
+                e_b_c,
+                g1_c,
+                g2_c,
+                factor=bond_fac_c,
             )
             _scatter_elements(e, Ke)
 
+    del uniq_keys
     data_3d = data.reshape(nnz_blk, 6, 6)
-    diag_blocks = data_3d[diag_pos].astype(np.float64)
-    # Regularize diagonal slightly if a free node had tiny numerical zero, invert safely
-    d_inv = np.linalg.inv(diag_blocks).astype(np.float32)
-    d_inv = 0.5 * (d_inv + d_inv.transpose(0, 2, 1))
-    return indptr, indices, data_3d, d_inv, uniq_keys, diag_pos
+    d_inv = np.empty((n, 6, 6), dtype=np.float32)
+    inv_chunk = 32768
+    for start in range(0, n, inv_chunk):
+        stop = min(n, start + inv_chunk)
+        blk = data_3d[diag_pos[start:stop]].astype(np.float64)
+        # Regularize/invert 6x6 blocks in chunks so we avoid ~800 MiB fp64 peak on large graphs
+        inv_blk = np.linalg.inv(blk)
+        inv_blk = 0.5 * (inv_blk + inv_blk.transpose(0, 2, 1))
+        d_inv[start:stop] = inv_blk.astype(np.float32)
+    del diag_pos
+    return indptr, indices, data_3d, d_inv, None, None
 
 
 def _connected_spatial_aggregates(node_xyz, fixed_mask_np, indptr, indices, box_mm):
@@ -574,8 +598,11 @@ def _connected_spatial_aggregates(node_xyz, fixed_mask_np, indptr, indices, box_
     same_box = (rows_all != cols_all) & (cell_key[rows_all] >= 0) & (cell_key[rows_all] == cell_key[cols_all])
     r_in = rows_all[same_box]
     c_in = cols_all[same_box]
+    del rows_all, same_box, cell_key, cell_key_free, cell_ijk
     g_in = coo_matrix((np.ones(len(r_in), dtype=np.int8), (r_in, c_in)), shape=(n, n)).tocsr()
+    del r_in, c_in
     _, comp_labels = connected_components(g_in, directed=False, return_labels=True)
+    del g_in
 
     # Remap components on free nodes to compact 0..M-1
     free_labels = comp_labels[free_idx]
@@ -593,31 +620,48 @@ def _connected_spatial_aggregates(node_xyz, fixed_mask_np, indptr, indices, box_
 
 
 def _galerkin_coarsen_bsr6(indptr, indices, data_3d, node_xyz, fixed_mask_np, agg_id, agg_xyz, out_fp64=False):
-    """Exact Galerkin coarse matrix K_c = P^T K P in 6x6 BSR."""
+    """Exact Galerkin coarse matrix K_c = P^T K P in 6x6 BSR (bounded-memory two-pass chunked)."""
     n = len(node_xyz)
     n_agg = len(agg_xyz)
     r_ij = np.zeros((n, 3), dtype=np.float64)
     free_mask = agg_id >= 0
     r_ij[free_mask] = node_xyz[free_mask] - agg_xyz[agg_id[free_mask]]
 
-    rows_all = np.repeat(np.arange(n, dtype=np.int32), np.diff(indptr))
-    cols_all = indices
-    valid = (agg_id[rows_all] >= 0) & (agg_id[cols_all] >= 0)
-    v_idx = np.flatnonzero(valid)
+    n_agg_i64 = np.int64(n_agg)
+    row_chunk = 65536
 
-    r_fine = rows_all[v_idx]
-    c_fine = cols_all[v_idx]
-    r_agg = agg_id[r_fine].astype(np.int64)
-    c_agg = agg_id[c_fine].astype(np.int64)
+    # Pass 1: discover unique coarse block keys in bounded-memory row chunks
+    uniq_parts = []
+    for r0 in range(0, n, row_chunk):
+        r1 = min(n, r0 + row_chunk)
+        p0 = int(indptr[r0])
+        p1 = int(indptr[r1])
+        if p1 <= p0:
+            continue
+        counts = np.diff(indptr[r0 : r1 + 1])
+        r_blk = np.repeat(np.arange(r0, r1, dtype=np.int32), counts)
+        c_blk = indices[p0:p1]
+        ra = agg_id[r_blk]
+        ca = agg_id[c_blk]
+        valid = (ra >= 0) & (ca >= 0)
+        if valid.any():
+            ck = ra[valid].astype(np.int64) * n_agg_i64 + ca[valid].astype(np.int64)
+            uniq_parts.append(np.unique(ck))
+        del counts, r_blk, ra, ca, valid
 
-    c_keys = r_agg * np.int64(n_agg) + c_agg
-    uniq_ckeys, inv_c = np.unique(c_keys, return_inverse=True)
+    if uniq_parts:
+        uniq_ckeys = np.unique(np.concatenate(uniq_parts))
+    else:
+        uniq_ckeys = np.empty((0,), dtype=np.int64)
+    del uniq_parts
+
     nnz_c = len(uniq_ckeys)
-    c_rows = (uniq_ckeys // np.int64(n_agg)).astype(np.int32)
-    c_cols = (uniq_ckeys % np.int64(n_agg)).astype(np.int32)
+    c_rows = (uniq_ckeys // n_agg_i64).astype(np.int32)
+    c_cols = (uniq_ckeys % n_agg_i64).astype(np.int32)
     c_indptr = np.zeros(n_agg + 1, dtype=np.int32)
     np.cumsum(np.bincount(c_rows, minlength=n_agg), out=c_indptr[1:])
     c_indices = c_cols
+    del c_rows
 
     def _skew_3(r):
         S = np.zeros((len(r), 3, 3), dtype=np.float64)
@@ -629,25 +673,40 @@ def _galerkin_coarsen_bsr6(indptr, indices, data_3d, node_xyz, fixed_mask_np, ag
         S[:, 2, 1] = r[:, 0]
         return S
 
+    # Pass 2: accumulate P_i^T K_ij P_j in bounded-memory sub-chunks
     c_data = np.zeros((nnz_c, 6, 6), dtype=np.float64)
-    chunk = 65536
-    for start in range(0, len(v_idx), chunk):
-        stop = min(len(v_idx), start + chunk)
-        sl = v_idx[start:stop]
-        dest = inv_c[start:stop]
-        K = data_3d[sl].astype(np.float64)
-        Si = _skew_3(r_ij[r_fine[start:stop]])
-        Sj = _skew_3(r_ij[c_fine[start:stop]])
-        K00 = K[:, :3, :3]
-        K01 = K[:, :3, 3:]
-        K10 = K[:, 3:, :3]
-        K11 = K[:, 3:, 3:]
-        C = np.empty_like(K)
-        C[:, :3, :3] = K00
-        C[:, :3, 3:] = K01 - K00 @ Sj
-        C[:, 3:, :3] = K10 + Si @ K00
-        C[:, 3:, 3:] = K11 + Si @ K01 - K10 @ Sj - Si @ K00 @ Sj
-        np.add.at(c_data, dest, C)
+    blk_chunk = 32768
+    for r0 in range(0, n, row_chunk):
+        r1 = min(n, r0 + row_chunk)
+        p0 = int(indptr[r0])
+        p1 = int(indptr[r1])
+        if p1 <= p0:
+            continue
+        counts = np.diff(indptr[r0 : r1 + 1])
+        r_blk = np.repeat(np.arange(r0, r1, dtype=np.int32), counts)
+        c_blk = indices[p0:p1]
+        ra = agg_id[r_blk]
+        ca = agg_id[c_blk]
+        v_loc = np.flatnonzero((ra >= 0) & (ca >= 0))
+        for s0 in range(0, len(v_loc), blk_chunk):
+            loc = v_loc[s0 : s0 + blk_chunk]
+            rf = r_blk[loc]
+            cf = c_blk[loc]
+            dest = np.searchsorted(uniq_ckeys, ra[loc].astype(np.int64) * n_agg_i64 + ca[loc].astype(np.int64))
+            K = data_3d[p0 + loc].astype(np.float64)
+            Si = _skew_3(r_ij[rf])
+            Sj = _skew_3(r_ij[cf])
+            K00 = K[:, :3, :3]
+            K01 = K[:, :3, 3:]
+            K10 = K[:, 3:, :3]
+            K11 = K[:, 3:, 3:]
+            C = np.empty_like(K)
+            C[:, :3, :3] = K00
+            C[:, :3, 3:] = K01 - K00 @ Sj
+            C[:, 3:, :3] = K10 + Si @ K00
+            C[:, 3:, 3:] = K11 + Si @ K01 - K10 @ Sj - Si @ K00 @ Sj
+            np.add.at(c_data, dest, C)
+        del counts, r_blk, ra, ca, v_loc
 
     c_diag_pos = np.searchsorted(uniq_ckeys, np.arange(n_agg, dtype=np.int64) * np.int64(n_agg + 1))
     diag_blk = c_data[c_diag_pos]
@@ -772,7 +831,7 @@ def solve_toolpath_graph_gpu(
     force=(0.0, 0.0, -10.0),
     load_point=None,
     rtol=1e-7,
-    max_outer_ir=20,
+    max_outer_ir=30,
     max_inner_iter=250,
     coarse_dof_target=30000,
     smooth_degree=3,
@@ -842,7 +901,7 @@ def solve_toolpath_graph_gpu(
                 e_b,
                 g1,
                 g2,
-                factor=_bond_scale_factors(graph.bond_type, graph.bond_dt, seam_cfg),
+                factor=_bond_scale_factors(graph.bond_type, graph.bond_dt, seam_cfg, graph.bond_normal),
             )
             dofs = np.column_stack([e[:, 0:1] * 6 + np.arange(6), e[:, 1:2] * 6 + np.arange(6)])
             rows_list.append(np.repeat(dofs, 12, axis=1).ravel())
@@ -884,6 +943,7 @@ def solve_toolpath_graph_gpu(
             fixed_mask_dev=wp.array(fixed_mask_np, dtype=wp.uint8, device=used_device),
             lambda_max=2.0,
         )
+        del d_inv0
         lvl0.lambda_max = _estimate_lambda_max_6(lvl0, scratch_256, cg_x, cg_r, used_device)
         levels = [lvl0]
         levels_summary = [
@@ -910,6 +970,7 @@ def solve_toolpath_graph_gpu(
                 cur_indptr, cur_indices, cur_data, cur_xyz, cur_fixed, agg_id, agg_xyz, out_fp64=not need_more
             )
             levels[-1].r_ij_dev = wp.array(r_ij_f32, dtype=wp.float32, device=used_device)
+            del agg_id, r_ij_f32
             c_fixed = np.zeros(len(agg_xyz), dtype=np.uint8)
             c_nd = 6 * len(agg_xyz)
 
@@ -929,6 +990,7 @@ def solve_toolpath_graph_gpu(
                 d_dev=wp.zeros(c_nd, dtype=wp.float32, device=used_device),
                 ax_dev=wp.zeros(c_nd, dtype=wp.float32, device=used_device),
             )
+            del c_d_inv
             c_lvl.lambda_max = _estimate_lambda_max_6(c_lvl, scratch_256, c_lvl.x_dev, c_lvl.r_dev, used_device)
             levels.append(c_lvl)
             levels_summary.append(
@@ -943,10 +1005,13 @@ def solve_toolpath_graph_gpu(
             )
             cur_xyz, cur_fixed = agg_xyz, c_fixed
             cur_indptr, cur_indices, cur_data = c_indptr, c_indices, c_data
+            indptr0 = indices0 = data0 = None
+            gc.collect()
             box_mm = 6.0
 
-        # Release huge Level-0 CPU BSR arrays once uploaded to GPU!
-        del indptr0, indices0, data0, d_inv0
+        # Release Level-0 CPU BSR references if loop exited early before coarsening
+        indptr0 = indices0 = data0 = None
+        gc.collect()
 
         # Setup coarsest-level exact splu or PyAMG V-cycle
         coarsest = levels[-1]
@@ -1012,36 +1077,42 @@ def solve_toolpath_graph_gpu(
         used_jacobi_fallback = False
 
         if f_norm > 0.0:
-            for outer in range(max_outer_ir):
-                outer_iters = outer + 1
-                if outer == 0:
-                    r_64 = f_64.copy()
-                else:
-                    y_64 = matvec_elements_f64(graph, material, seam_cfg, u_64_host)
-                    r_64 = f_64 - y_64
-                r_64[~free_dof_mask] = 0.0
-                r_norm = float(np.linalg.norm(r_64[free_dof_mask]))
-                rel_res = r_norm / f_norm
-                residual_history.append(rel_res)
-                if rel_res <= rtol:
-                    break
+            m_trunc = 4 if n_dofs <= 8_000_000 else 2
+            fcg_hist = []
+            r_64 = f_64.copy()
+            r_64[~free_dof_mask] = 0.0
+            r_norm = float(np.linalg.norm(r_64[free_dof_mask]))
+            rel_res = r_norm / f_norm
+            residual_history.append(rel_res)
+            inner_cap = min(max_inner_iter, 35 if len(levels) > 1 else 60)
 
+            def _apply_precond(rhs_d, z_d):
+                if len(levels) > 1 and not used_jacobi_fallback:
+                    _vcycle(0, rhs_d, z_d, cg_v_r, cg_d_tmp, cg_ap)
+                else:
+                    wp.launch(
+                        _block6_precond_f32_kernel,
+                        dim=lvl0.n_nodes,
+                        inputs=[lvl0.fixed_mask_dev, lvl0.d_inv_dev, rhs_d, z_d],
+                        device=used_device,
+                    )
+
+            for outer in range(max_outer_ir):
+                if rel_res <= rtol:
+                    y_chk = matvec_elements_f64(graph, material, seam_cfg, u_64_host)
+                    r_64 = f_64 - y_chk
+                    r_64[~free_dof_mask] = 0.0
+                    r_norm = float(np.linalg.norm(r_64[free_dof_mask]))
+                    rel_res = r_norm / f_norm
+                    if rel_res <= rtol:
+                        break
+
+                outer_iters = outer + 1
                 r_scaled = (r_64 / r_norm).astype(np.float32)
                 cg_x.zero_()
                 wp.copy(cg_r, wp.from_numpy(r_scaled, dtype=wp.float32))
                 r0_f32 = math.sqrt(max(_gpu_dot_f32(cg_r, cg_r, scratch_256, used_device), 1e-30))
-                inner_target = max(min(2e-4, rtol / max(rel_res, 1e-30) * 0.1), 2e-5)
-
-                def _apply_precond(rhs_d, z_d):
-                    if len(levels) > 1 and not used_jacobi_fallback:
-                        _vcycle(0, rhs_d, z_d, cg_v_r, cg_d_tmp, cg_ap)
-                    else:
-                        wp.launch(
-                            _block6_precond_f32_kernel,
-                            dim=lvl0.n_nodes,
-                            inputs=[lvl0.fixed_mask_dev, lvl0.d_inv_dev, rhs_d, z_d],
-                            device=used_device,
-                        )
+                inner_target = 1.5e-2
 
                 _apply_precond(cg_r, cg_z)
                 rz_old = _gpu_dot_f32(cg_r, cg_z, scratch_256, used_device)
@@ -1051,15 +1122,15 @@ def solve_toolpath_graph_gpu(
                     rz_old = _gpu_dot_f32(cg_r, cg_z, scratch_256, used_device)
                 wp.copy(cg_p, cg_z)
 
-                for _it in range(1, max_inner_iter + 1):
+                for _it in range(1, inner_cap + 1):
                     total_inner_iters += 1
                     _launch_bsr6_matvec(lvl0, cg_p, cg_ap, used_device)
                     pAp = _gpu_dot_f32(cg_p, cg_ap, scratch_256, used_device)
                     if pAp <= 0.0:
                         break
-                    alpha = np.float32(rz_old / pAp)
-                    wp.launch(_axpby_6_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_x, alpha, cg_p, cg_x], device=used_device)
-                    wp.launch(_axpby_6_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_r, np.float32(-alpha), cg_ap, cg_r], device=used_device)
+                    alpha_f32 = np.float32(rz_old / pAp)
+                    wp.launch(_axpby_6_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_x, alpha_f32, cg_p, cg_x], device=used_device)
+                    wp.launch(_axpby_6_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_r, np.float32(-alpha_f32), cg_ap, cg_r], device=used_device)
                     r_cur = math.sqrt(max(_gpu_dot_f32(cg_r, cg_r, scratch_256, used_device), 0.0))
                     if r_cur / r0_f32 <= inner_target:
                         break
@@ -1067,11 +1138,53 @@ def solve_toolpath_graph_gpu(
                     rz_new = _gpu_dot_f32(cg_r, cg_z, scratch_256, used_device)
                     if rz_new <= 0.0:
                         break
-                    beta = np.float32(rz_new / rz_old)
-                    wp.launch(_axpby_6_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_z, beta, cg_p, cg_p], device=used_device)
+                    beta_f32 = np.float32(rz_new / rz_old)
+                    wp.launch(_axpby_6_f32_kernel, dim=n_dofs, inputs=[np.float32(1.0), cg_z, beta_f32, cg_p, cg_p], device=used_device)
                     rz_old = rz_new
 
-                u_64_host[free_dof_mask] += cg_x.numpy().astype(np.float64)[free_dof_mask] * r_norm
+                z_64 = cg_x.numpy().astype(np.float64) * r_norm
+                z_64[~free_dof_mask] = 0.0
+
+                p_i = z_64.copy()
+                for pj, qj, dj in fcg_hist:
+                    beta_j = float(np.dot(p_i, qj)) / dj
+                    p_i -= beta_j * pj
+                p_i[~free_dof_mask] = 0.0
+
+                q_i = matvec_elements_f64(graph, material, seam_cfg, p_i)
+                q_i[~free_dof_mask] = 0.0
+                delta_i = float(np.dot(p_i, q_i))
+                pr = float(np.dot(p_i, r_64))
+                if not np.isfinite(delta_i) or delta_i <= 0.0 or pr <= 0.0:
+                    fcg_hist.clear()
+                    p_i = z_64
+                    q_i = matvec_elements_f64(graph, material, seam_cfg, p_i)
+                    q_i[~free_dof_mask] = 0.0
+                    delta_i = float(np.dot(p_i, q_i))
+                    pr = float(np.dot(p_i, r_64))
+                    if not np.isfinite(delta_i) or delta_i <= 0.0 or pr <= 0.0:
+                        break
+
+                alpha = pr / delta_i
+                u_64_host[free_dof_mask] += alpha * p_i[free_dof_mask]
+                r_64[free_dof_mask] -= alpha * q_i[free_dof_mask]
+
+                fcg_hist.append((p_i, q_i, delta_i))
+                if len(fcg_hist) > m_trunc:
+                    fcg_hist.pop(0)
+
+                r_norm = float(np.linalg.norm(r_64[free_dof_mask]))
+                rel_res = r_norm / f_norm
+                if (outer_iters % 5 == 0) or (rel_res <= rtol):
+                    y_chk = matvec_elements_f64(graph, material, seam_cfg, u_64_host)
+                    r_64 = f_64 - y_chk
+                    r_64[~free_dof_mask] = 0.0
+                    r_norm = float(np.linalg.norm(r_64[free_dof_mask]))
+                    rel_res = r_norm / f_norm
+                residual_history.append(rel_res)
+                if rel_res <= rtol:
+                    break
+            del fcg_hist
 
         solve_seconds = time.perf_counter() - t_solve
 
@@ -1165,23 +1278,141 @@ def solve_toolpath_graph_gpu(
     }
 
 
+def estimate_uniform_calibration(graph_work_u, target_work_u):
+    """Estimate uniform calibration factors (beam_cal, bond_cal) matching target compliance."""
+    gw = float(graph_work_u)
+    tw = float(target_work_u)
+    if gw <= 0.0 or tw <= 0.0 or not (math.isfinite(gw) and math.isfinite(tw)):
+        raise ValueError("Work-conjugate displacements must be positive finite numbers")
+    cal = float(np.clip(gw / tw, 0.2, 10.0))
+    return cal, cal
+
+
+def calibrate_graph_to_continuum(
+    graph: ToolpathGraph,
+    material: Material,
+    target_work_u,
+    fixed,
+    loaded,
+    force,
+    load_point=None,
+    base_seam_cfg: SeamConfig = None,
+    device="auto",
+    mode="split",
+    max_evals=3,
+    rtol=1e-7,
+):
+    """Calibrate ideal network beam/bond stiffness factors to match a continuum H8 work displacement."""
+    target_u = float(target_work_u)
+    if target_u <= 0.0 or not math.isfinite(target_u):
+        raise ValueError("target_work_u must be positive finite")
+    if mode not in ("split", "uniform"):
+        raise ValueError("calibration mode must be 'split' or 'uniform'")
+
+    base = SeamConfig.from_dict(base_seam_cfg.to_dict()) if base_seam_cfg is not None else SeamConfig.ideal()
+
+    def _eval(beam_c, bond_c):
+        cfg_try = SeamConfig.from_dict(base.to_dict())
+        cfg_try.beam_calibration_factor = float(beam_c)
+        cfg_try.bond_calibration_factor = float(bond_c)
+        res = solve_toolpath_graph_gpu(
+            graph,
+            material=material,
+            seam_cfg=cfg_try,
+            fixed=fixed,
+            loaded=loaded,
+            force=force,
+            load_point=load_point,
+            rtol=rtol,
+            device=device,
+        )
+        return float(res["solver_info"]["work_conjugate_displacement_mm"]), cfg_try
+
+    if mode == "uniform":
+        wu0, cfg0 = _eval(1.0, 1.0)
+        cal, _ = estimate_uniform_calibration(wu0, target_u)
+        wu_fin, cfg_fin = _eval(cal, cal)
+        audit = {
+            "mode": "uniform",
+            "target_work_u_mm": target_u,
+            "initial_work_u_mm": wu0,
+            "final_work_u_mm": wu_fin,
+            "relative_error": abs(wu_fin - target_u) / target_u,
+            "beam_calibration_factor": float(cfg_fin.beam_calibration_factor),
+            "bond_calibration_factor": float(cfg_fin.bond_calibration_factor),
+            "evals": 2,
+        }
+        return cfg_fin, audit
+
+    # Split calibration: longitudinal in-plane Poisson correction on beams + discrete weld bond scaling.
+    e1 = max(float(material.e1), 1e-12)
+    e2 = float(material.e2)
+    nu12 = float(material.nu12)
+    beam_cal = float(1.0 / max(1.0 - nu12 * (nu12 * e2 / e1), 0.5))
+
+    trials = []
+    wu1, cfg1 = _eval(beam_cal, 1.0)
+    trials.append((1.0, wu1, cfg1))
+
+    if max_evals >= 2 and abs(wu1 - target_u) / target_u > 0.015:
+        bcal2 = float(np.clip((wu1 / target_u) ** 1.35, 0.25, 8.0))
+        if abs(bcal2 - 1.0) >= 1e-3:
+            wu2, cfg2 = _eval(beam_cal, bcal2)
+            trials.append((bcal2, wu2, cfg2))
+            if max_evals >= 3 and abs(wu2 - target_u) / target_u > 0.015:
+                denom = math.log(max(wu2, 1e-30) / max(wu1, 1e-30))
+                if abs(denom) > 1e-9:
+                    slope = math.log(bcal2) / denom
+                    bcal3 = float(np.clip(bcal2 * math.exp(slope * math.log(target_u / max(wu2, 1e-30))), 0.2, 10.0))
+                else:
+                    bcal3 = float(np.clip(bcal2 * (wu2 / target_u), 0.2, 10.0))
+                if abs(bcal3 - bcal2) >= 1e-3:
+                    wu3, cfg3 = _eval(beam_cal, bcal3)
+                    trials.append((bcal3, wu3, cfg3))
+
+    _, best_wu, best_cfg = min(trials, key=lambda t: abs(t[1] - target_u))
+    eval_count = len(trials)
+    if abs(best_wu - target_u) / target_u > 0.015:
+        hom_scale = float(np.clip(best_wu / target_u, 0.2, 10.0))
+        cal_beam = float(np.clip(best_cfg.beam_calibration_factor * hom_scale, 0.2, 10.0))
+        cal_bond = float(np.clip(best_cfg.bond_calibration_factor * hom_scale, 0.2, 10.0))
+        best_wu, best_cfg = _eval(cal_beam, cal_bond)
+        eval_count += 1
+
+    audit = {
+        "mode": "split",
+        "target_work_u_mm": target_u,
+        "initial_work_u_mm": wu1,
+        "final_work_u_mm": best_wu,
+        "relative_error": abs(best_wu - target_u) / target_u,
+        "beam_calibration_factor": float(best_cfg.beam_calibration_factor),
+        "bond_calibration_factor": float(best_cfg.bond_calibration_factor),
+        "evals": eval_count,
+    }
+    return best_cfg, audit
+
+
 def recover_graph_stress_streaming(
     graph: ToolpathGraph,
     displacement_6dof,
     material=None,
     seam_cfg: SeamConfig = None,
+    strength_cfg: StrengthConfig = None,
     chunk_size=32768,
     spill_path=None,
 ):
-    """Stream beams & eccentric bonds to compute feature/seam/start-stop stress audits."""
+    """Stream beams & eccentric bonds to compute feature/seam/start-stop stress and FoS audits."""
     t0 = time.perf_counter()
     material = material or Material()
     seam_cfg = seam_cfg or SeamConfig()
+    strength_cfg = strength_cfg or StrengthConfig()
+    p_exp = float(strength_cfg.strength_scale_exponent)
     u_nodes = np.asarray(displacement_6dof, dtype=np.float64)
 
     # Beams
     mb = graph.num_beams
     beam_sc = _beam_scale_factors(graph.beam_flags, seam_cfg)
+    beam_deg = _beam_degradation_factors(graph.beam_flags, seam_cfg)
     b_vm = np.empty(mb, dtype=np.float32)
     b_ax = np.empty(mb, dtype=np.float32)
     b_fib = np.empty(mb, dtype=np.float32)
@@ -1202,6 +1433,9 @@ def recover_graph_stress_streaming(
         b_ax[start:stop] = st["sigma_axial"].astype(np.float32)
         b_fib[start:stop] = st["sigma_fiber_max"].astype(np.float32)
 
+    b_allow = (np.minimum(beam_deg, 1.0) ** p_exp) * float(strength_cfg.sigma_beam_allow_MPa)
+    b_fi = (b_vm / np.maximum(b_allow, 1e-9)).astype(np.float32) if mb else np.empty(0, dtype=np.float32)
+
     # Bonds
     mk = graph.num_bonds
     k_sn = np.empty(mk, dtype=np.float32)
@@ -1209,20 +1443,27 @@ def recover_graph_stress_streaming(
     k_tau = np.empty(mk, dtype=np.float32)
     k_eq = np.empty(mk, dtype=np.float32)
     k_eq_peak = np.empty(mk, dtype=np.float32)
+    k_jump = np.empty(mk, dtype=np.float32)
+    k_fi = np.empty(mk, dtype=np.float32)
 
     if mk:
-        bond_fac = _bond_scale_factors(graph.bond_type, graph.bond_dt, seam_cfg)
+        bond_fac = _bond_scale_factors(graph.bond_type, graph.bond_dt, seam_cfg, graph.bond_normal)
+        bond_deg = _bond_degradation_factors(graph.bond_type, graph.bond_dt, graph.bond_normal, seam_cfg)
         e_b, g1, g2 = _bond_moduli(graph.bond_type, material)
         for start in range(0, mk, chunk_size):
             stop = min(mk, start + chunk_size)
             e = graph.bond_edges[start:stop]
             geom = graph.bond_geom[start:stop].astype(np.float64)
+            pa = graph.node_xyz[e[:, 0]]
+            pb = graph.node_xyz[e[:, 1]]
+            pc = graph.bond_pc[start:stop]
+            nv = graph.bond_normal[start:stop]
             ue = np.concatenate([u_nodes[e[:, 0]], u_nodes[e[:, 1]]], axis=1)
             st = bond_interface_stress_batch(
-                graph.node_xyz[e[:, 0]],
-                graph.node_xyz[e[:, 1]],
-                graph.bond_pc[start:stop],
-                graph.bond_normal[start:stop],
+                pa,
+                pb,
+                pc,
+                nv,
                 graph.bond_t1[start:stop],
                 graph.bond_t2[start:stop],
                 geom[:, 1],
@@ -1234,11 +1475,28 @@ def recover_graph_stress_streaming(
                 ue,
                 factor=bond_fac[start:stop],
             )
-            k_sn[start:stop] = st["sigma_n"].astype(np.float32)
-            k_sn_peak[start:stop] = st["sigma_n_peak"].astype(np.float32)
-            k_tau[start:stop] = st["tau"].astype(np.float32)
-            k_eq[start:stop] = st["equiv_traction"].astype(np.float32)
-            k_eq_peak[start:stop] = st["equiv_peak_traction"].astype(np.float32)
+            sn_c = st["sigma_n"].astype(np.float32)
+            sn_pk_c = st["sigma_n_peak"].astype(np.float32)
+            tau_c = st["tau"].astype(np.float32)
+            eq_c = st["equiv_traction"].astype(np.float32)
+            eq_pk_c = st["equiv_peak_traction"].astype(np.float32)
+            k_sn[start:stop] = sn_c
+            k_sn_peak[start:stop] = sn_pk_c
+            k_tau[start:stop] = tau_c
+            k_eq[start:stop] = eq_c
+            k_eq_peak[start:stop] = eq_pk_c
+
+            du_c = (ue[:, 6:9] + np.cross(ue[:, 9:12], pc - pb)) - (ue[:, :3] + np.cross(ue[:, 3:6], pc - pa))
+            k_jump[start:stop] = np.linalg.norm(du_c, axis=1).astype(np.float32)
+
+            is_inter = np.abs(nv[:, 2]) > 0.5
+            s_n_base = np.where(is_inter, strength_cfg.sigma_interlayer_allow_MPa, strength_cfg.sigma_lateral_allow_MPa)
+            s_t_base = np.where(is_inter, strength_cfg.tau_interlayer_allow_MPa, strength_cfg.tau_lateral_allow_MPa)
+            f_str = np.minimum(bond_deg[start:stop], 1.0) ** p_exp
+            k_fi[start:stop] = np.sqrt(
+                (np.maximum(sn_pk_c.astype(np.float64), 0.0) / np.maximum(s_n_base * f_str, 1e-9)) ** 2
+                + (tau_c.astype(np.float64) / np.maximum(s_t_base * f_str, 1e-9)) ** 2
+            ).astype(np.float32)
 
     if spill_path is not None:
         spill_p = Path(spill_path)
@@ -1264,6 +1522,7 @@ def recover_graph_stress_streaming(
             "von_mises_max_MPa": float(b_vm[msk].max()),
             "von_mises_p95_MPa": float(np.percentile(b_vm[msk], 95)),
             "axial_max_abs_MPa": float(np.abs(b_ax[msk]).max()),
+            "failure_index_max": float(b_fi[msk].max()),
         }
 
     start_zone = (graph.beam_flags & NODE_START_ZONE) != 0
@@ -1276,6 +1535,7 @@ def recover_graph_stress_streaming(
                 "beams": int(zmask.sum()),
                 "von_mises_max_MPa": float(b_vm[zmask].max()),
                 "von_mises_p95_MPa": float(np.percentile(b_vm[zmask], 95)),
+                "failure_index_max": float(b_fi[zmask].max()),
             }
 
     # Bond stress breakdown & top seam/start/stop hotspots
@@ -1284,6 +1544,7 @@ def recover_graph_stress_streaming(
         msk = graph.bond_type == bcode
         if not msk.any():
             continue
+        fi_max = float(k_fi[msk].max())
         bond_by_type[bname] = {
             "bonds": int(msk.sum()),
             "sigma_n_max_MPa": float(k_sn[msk].max()),
@@ -1292,6 +1553,10 @@ def recover_graph_stress_streaming(
             "equiv_traction_max_MPa": float(k_eq[msk].max()),
             "equiv_traction_p95_MPa": float(np.percentile(k_eq[msk], 95)),
             "equiv_peak_traction_max_MPa": float(k_eq_peak[msk].max()),
+            "opening_jump_max_mm": float(k_jump[msk].max()),
+            "failure_index_max": fi_max,
+            "failure_index_p95": float(np.percentile(k_fi[msk], 95)),
+            "fos_min": (1.0 / fi_max) if fi_max > 1e-12 else None,
         }
 
     def _top_bond_hotspots(mask, score_arr, label, top_k=20):
@@ -1306,7 +1571,11 @@ def recover_graph_stress_streaming(
             {
                 "bond_type": BOND_TYPE_NAMES.get(int(graph.bond_type[i]), "unknown"),
                 label: float(score_arr[i]),
+                "failure_index": float(k_fi[i]),
+                "fos": (1.0 / float(k_fi[i])) if float(k_fi[i]) > 1e-12 else None,
+                "opening_jump_mm": float(k_jump[i]),
                 "sigma_n_MPa": float(k_sn[i]),
+                "sigma_n_peak_MPa": float(k_sn_peak[i]),
                 "tau_MPa": float(k_tau[i]),
                 "xyz_mm": graph.bond_pc[i].tolist(),
             }
@@ -1317,6 +1586,15 @@ def recover_graph_stress_streaming(
         graph.bond_type,
         [BOND_SEAM_CLOSED, BOND_SEAM_SCARF, BOND_START_ANCHOR, BOND_STOP_ANCHOR],
     )
+    beam_fi_max = float(b_fi.max()) if mb else 0.0
+    bond_fi_max = float(k_fi.max()) if mk else 0.0
+    seam_anchor_fi_max = float(k_fi[seam_mask].max()) if seam_mask.any() else 0.0
+    max_fi = max(beam_fi_max, bond_fi_max)
+    if mk and bond_fi_max >= beam_fi_max:
+        top_btype = BOND_TYPE_NAMES.get(int(graph.bond_type[int(np.argmax(k_fi))]), "bond")
+        limiting_mode = f"bond:{top_btype}"
+    else:
+        limiting_mode = "beam"
 
     return {
         "beam_count": int(mb),
@@ -1326,14 +1604,27 @@ def recover_graph_stress_streaming(
         "bond_sigma_n_max_MPa": float(k_sn.max()) if mk else 0.0,
         "bond_tau_max_MPa": float(k_tau.max()) if mk else 0.0,
         "bond_equiv_traction_max_MPa": float(k_eq.max()) if mk else 0.0,
+        "strength_config": strength_cfg.to_dict(),
+        "safety_audit": {
+            "max_failure_index": max_fi,
+            "min_fos": (1.0 / max_fi) if max_fi > 1e-12 else None,
+            "limiting_mode": limiting_mode,
+            "beam_failure_index_max": beam_fi_max,
+            "bond_failure_index_max": bond_fi_max,
+            "seam_and_anchor_failure_index_max": seam_anchor_fi_max,
+            "thermal_decay_active": bool(seam_cfg.thermal_decay_tau_s > 0.0),
+            "note": "screening_only_uncalibrated_reference_strengths",
+        },
         "beam_by_feature": beam_by_feature,
         "beam_by_zone": beam_zones,
         "bond_by_type": bond_by_type,
         "top_seam_and_anchor_hotspots": _top_bond_hotspots(seam_mask, k_eq_peak, "equiv_peak_traction_MPa"),
         "top_interlayer_hotspots": _top_bond_hotspots(graph.bond_type == BOND_INTERLAYER, k_eq_peak, "equiv_peak_traction_MPa"),
+        "top_failure_hotspots": _top_bond_hotspots(np.ones(mk, dtype=bool), k_fi, "failure_index") if mk else [],
         "recovery_seconds": time.perf_counter() - t0,
         "spill_path": str(spill_p.resolve()) if spill_p is not None else None,
         "_beam_vm": b_vm,
         "_bond_sn": k_sn,
         "_bond_eq_peak": k_eq_peak,
+        "_bond_fi": k_fi,
     }

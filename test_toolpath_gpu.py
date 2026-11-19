@@ -7,6 +7,7 @@ import numpy as np
 from scipy.sparse.linalg import spsolve
 
 from gpu_hex_solver import (
+    HexInterfaceConfig,
     assemble_coarse_csr,
     build_level_topology,
     extract_boundary_quads,
@@ -28,7 +29,10 @@ from toolpath_bricks import (
     FEATURE_OUTER_WALL,
     FEATURE_SOLID_INFILL,
     FEATURE_SPARSE_INFILL,
+    FLAG_BEAD_INTERFACE,
     FLAG_BEAD_OVERLAP,
+    FLAG_SEAM_LOOP,
+    FLAG_START_STOP_ZONE,
     box_to_bricks,
     decode_feature,
     gcode_to_bricks,
@@ -323,6 +327,70 @@ class ToolpathGpuTests(unittest.TestCase):
             raw = spill_file.read_bytes()
             expected_len = 16 + grid.num_voxels * 5 * 4
             self.assertEqual(len(raw), expected_len)
+
+    def test_hex_interface_flags_and_weakening(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gcode_p = Path(tmp) / "iface.gcode"
+            lines = ["G21", "G90", "M83", "; LAYER_HEIGHT: 0.2", "; LINE_WIDTH: 0.4"]
+            for lay in range(4):
+                z = 0.2 * (lay + 1)
+                lines.append(f"; CHANGE_LAYER\nG1 Z{z:.2f} F600")
+                lines.append("; FEATURE: Outer wall")
+                lines.extend([
+                    "G0 X0.0 Y0.0 F3000",
+                    "G1 X8.0 Y0.0 E0.4 F1800",
+                    "G1 X8.0 Y4.0 E0.2",
+                    "G1 X0.0 Y4.0 E0.4",
+                    "G1 X0.0 Y0.0 E0.2",
+                ])
+                lines.append("; FEATURE: Inner wall")
+                lines.extend([
+                    "G0 X0.34 Y0.34",
+                    "G1 X7.66 Y0.34 E0.35",
+                    "G1 X7.66 Y3.66 E0.15",
+                    "G1 X0.34 Y3.66 E0.35",
+                    "G1 X0.34 Y0.34 E0.15",
+                ])
+                lines.append("; FEATURE: Sparse infill")
+                lines.append("G0 X0.5 Y2.0\nG1 X7.5 Y2.0 E0.3")
+            gcode_p.write_text("\n".join(lines), encoding="utf-8")
+
+            grid = gcode_to_bricks(gcode_p, pitch=0.2)
+            self.assertEqual(grid.meta.get("flags_version"), 2)
+            self.assertGreater(grid.meta.get("start_stop_voxel_count", 0), 0)
+            self.assertGreater(grid.meta.get("bead_interface_voxel_count", 0), 0)
+            self.assertGreater(grid.meta.get("seam_loop_voxel_count", 0), 0)
+
+            active_bit = ((grid.brick_masks[:, None] >> np.arange(64, dtype=np.uint64)[None, :]) & np.uint64(1)) != 0
+            _, _, flags = unpack_payload(grid.brick_payload)
+            fa = flags[active_bit]
+            self.assertTrue(np.any((fa & FLAG_START_STOP_ZONE) != 0))
+            self.assertTrue(np.any((fa & FLAG_BEAD_INTERFACE) != 0))
+            self.assertTrue(np.any((fa & FLAG_SEAM_LOOP) != 0))
+
+            m = Material()
+            c_ideal = HexInterfaceConfig.ideal()
+            c_mid = HexInterfaceConfig(seam_factor=0.6, start_stop_factor=0.85, bead_interface_factor=0.9, interlayer_shear_factor=0.9)
+            c_weak = HexInterfaceConfig.default_weakened()
+
+            r_id = solve_hex_gpu(grid, material=m, interface_cfg=c_ideal, fixed="X-", loaded="X+", force=(0.0, 0.0, -0.5), rtol=1e-7)
+            r_md = solve_hex_gpu(grid, material=m, interface_cfg=c_mid, fixed="X-", loaded="X+", force=(0.0, 0.0, -0.5), rtol=1e-7)
+            r_wk = solve_hex_gpu(grid, material=m, interface_cfg=c_weak, fixed="X-", loaded="X+", force=(0.0, 0.0, -0.5), rtol=1e-7)
+
+            for r in (r_id, r_md, r_wk):
+                self.assertLess(r["solver_info"]["relative_residual"], 1e-6)
+                self.assertLess(r["solver_info"]["force_relative_error"], 1e-6)
+                self.assertLess(r["solver_info"]["moment_relative_error"], 1e-6)
+
+            self.assertLess(r_id["solver_info"]["compliance_mm_per_N"], r_md["solver_info"]["compliance_mm_per_N"])
+            self.assertLess(r_md["solver_info"]["compliance_mm_per_N"], r_wk["solver_info"]["compliance_mm_per_N"])
+
+            _, _, bnodes, _ = build_level_topology(grid)
+            st_wk = recover_stress_streaming(grid, bnodes, r_wk["displacement"], material=m, interface_cfg=c_weak)
+            self.assertIn("seam_loop", st_wk["by_zone"])
+            self.assertIn("start_stop_zone", st_wk["by_zone"])
+            self.assertIn("bead_interface", st_wk["by_zone"])
+            self.assertIn("interior", st_wk["by_zone"])
 
 
 if __name__ == "__main__":

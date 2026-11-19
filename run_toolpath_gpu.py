@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from gpu_hex_solver import recover_stress_streaming, solve_hex_gpu
+from gpu_hex_solver import HexInterfaceConfig, recover_stress_streaming, solve_hex_gpu
 from solid import Material
 from toolpath_bricks import (
     FEATURE_NAMES,
@@ -111,10 +111,11 @@ def run_case(
     dz=None,
     output_dir="output/toolpath_gpu",
     bricks_cache=None,
+    interface_cfg: HexInterfaceConfig = None,
     device="auto",
     rtol=1e-7,
-    max_levels=5,
-    coarse_dof_target=25000,
+    max_levels=6,
+    coarse_dof_target=12000,
     spill_stress=False,
     keep_largest_component=True,
     render_preview=True,
@@ -122,6 +123,7 @@ def run_case(
     case_path = Path(case_path).resolve()
     cfg = json.loads(case_path.read_text(encoding="utf-8-sig"))
     base_dir = case_path.parent
+    interface_cfg = interface_cfg or HexInterfaceConfig()
 
     gcode_rel = cfg.get("gcode", "")
     if not gcode_rel:
@@ -142,12 +144,15 @@ def run_case(
     # Load from verified .tbricks cache if matching pitch & gcode, else stream-rasterize.
     t_start = time.perf_counter()
     grid = None
+    need_v2 = interface_cfg.is_weakened()
     if cache_path.is_file():
         try:
             cand = load_bricks(cache_path, verify_checksum=True)
             cand_pitch = cand.meta.get("pitch_mm", [])
+            version_ok = (not need_v2) or (int(cand.meta.get("flags_version", 1)) >= 2)
             if (
-                len(cand_pitch) == 3
+                version_ok
+                and len(cand_pitch) == 3
                 and abs(cand_pitch[0] - pitch) < 1e-9
                 and abs(cand_pitch[2] - (pitch if dz is None else dz)) < 1e-9
                 and cand.meta.get("source_gcode") == str(gcode_path)
@@ -172,6 +177,7 @@ def run_case(
     result = solve_hex_gpu(
         grid,
         material=material,
+        interface_cfg=interface_cfg,
         fixed=cfg.get("fixed", "X-"),
         loaded=cfg.get("loaded", "X+"),
         force=cfg.get("force", [0.0, 0.0, -10.0]),
@@ -189,6 +195,7 @@ def run_case(
         result["brick_nodes"],
         result["displacement"],
         material=material,
+        interface_cfg=interface_cfg,
         build_axis=build_axis,
         spill_path=spill_file,
     )
@@ -213,7 +220,7 @@ def run_case(
         "end_to_end_seconds": time.perf_counter() - t_start,
     }
     summary_path = out_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
     return summary
 
 
@@ -224,14 +231,29 @@ def main(argv=None):
     parser.add_argument("--dz", type=float, default=None, help="Z voxel pitch in mm (default: pitch)")
     parser.add_argument("--output", default="output/toolpath_gpu", help="Output directory")
     parser.add_argument("--bricks-cache", default=None, help="Optional .tbricks cache file path")
+    parser.add_argument("--weakened-interfaces", action="store_true", help="Enable default Route-2 interface weakening")
+    parser.add_argument("--seam-factor", type=float, default=None)
+    parser.add_argument("--start-stop-factor", type=float, default=None)
+    parser.add_argument("--bead-interface-factor", type=float, default=None)
+    parser.add_argument("--interlayer-factor", type=float, default=None)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda:0", "cpu"])
     parser.add_argument("--rtol", type=float, default=1e-7, help="Outer fp64 residual tolerance")
-    parser.add_argument("--max-levels", type=int, default=5)
-    parser.add_argument("--coarse-dof-target", type=int, default=25000)
+    parser.add_argument("--max-levels", type=int, default=6)
+    parser.add_argument("--coarse-dof-target", type=int, default=12000)
     parser.add_argument("--spill-stress", action="store_true", help="Stream float32 stress fields to disk")
     parser.add_argument("--no-keep-largest", action="store_true", help="Reject instead of pruning disconnected islands")
     parser.add_argument("--no-preview", action="store_true", help="Skip 2D projection PNG")
     args = parser.parse_args(argv)
+
+    icfg = HexInterfaceConfig.default_weakened() if args.weakened_interfaces else HexInterfaceConfig.ideal()
+    if args.seam_factor is not None:
+        icfg.seam_factor = args.seam_factor
+    if args.start_stop_factor is not None:
+        icfg.start_stop_factor = args.start_stop_factor
+    if args.bead_interface_factor is not None:
+        icfg.bead_interface_factor = args.bead_interface_factor
+    if args.interlayer_factor is not None:
+        icfg.interlayer_shear_factor = args.interlayer_factor
 
     summary = run_case(
         args.case,
@@ -239,6 +261,7 @@ def main(argv=None):
         dz=args.dz,
         output_dir=args.output,
         bricks_cache=args.bricks_cache,
+        interface_cfg=icfg,
         device=args.device,
         rtol=args.rtol,
         max_levels=args.max_levels,
@@ -247,7 +270,7 @@ def main(argv=None):
         keep_largest_component=not args.no_keep_largest,
         render_preview=not args.no_preview,
     )
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False))
     return 0
 
 

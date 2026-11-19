@@ -50,6 +50,9 @@ FEATURE_PRIORITY = {
 
 FLAG_BEAD_OVERLAP = 1 << 0
 FLAG_MULTI_LAYER = 1 << 4
+FLAG_START_STOP_ZONE = 1 << 5
+FLAG_BEAD_INTERFACE = 1 << 6
+FLAG_SEAM_LOOP = 1 << 7
 
 _SKIP_FEATURE_KEYWORDS = (
     "skirt",
@@ -149,6 +152,7 @@ try:
     @wp.kernel
     def _rasterize_segments_2d_kernel(
         segments: wp.array(dtype=wp.float32, ndim=2),
+        seg_meta: wp.array(dtype=wp.int32, ndim=2),
         nx: wp.int32,
         ny: wp.int32,
         dx: wp.float32,
@@ -158,6 +162,9 @@ try:
         sin2_sum: wp.array(dtype=wp.float32, ndim=1),
         cov_sum: wp.array(dtype=wp.int32, ndim=1),
         feat_arr: wp.array(dtype=wp.int32, ndim=1),
+        bead_min: wp.array(dtype=wp.int32, ndim=1),
+        bead_max: wp.array(dtype=wp.int32, ndim=1),
+        seg_flag_arr: wp.array(dtype=wp.int32, ndim=1),
     ):
         tid = wp.tid()
         x0 = segments[tid, 0]
@@ -166,6 +173,8 @@ try:
         y1 = segments[tid, 3]
         r = segments[tid, 4]
         feat_prio = wp.int32(segments[tid, 5])
+        bid = seg_meta[tid, 0]
+        sflags = seg_meta[tid, 1]
         vx = x1 - x0
         vy = y1 - y0
         len2 = vx * vx + vy * vy
@@ -206,6 +215,10 @@ try:
                         wp.atomic_add(sin2_sum, idx, w * sin2)
                         wp.atomic_add(cov_sum, idx, pop)
                         wp.atomic_max(feat_arr, idx, feat_prio)
+                        wp.atomic_min(bead_min, idx, bid)
+                        wp.atomic_max(bead_max, idx, bid)
+                        if sflags != 0:
+                            wp.atomic_or(seg_flag_arr, idx, sflags)
         else:
             iy_min = wp.max(0, wp.int32(wp.floor((wp.min(y0, y1) - r) / dy)))
             iy_max = wp.min(ny - 1, wp.int32(wp.floor((wp.max(y0, y1) + r) / dy)))
@@ -235,6 +248,10 @@ try:
                         wp.atomic_add(sin2_sum, idx, w * sin2)
                         wp.atomic_add(cov_sum, idx, pop)
                         wp.atomic_max(feat_arr, idx, feat_prio)
+                        wp.atomic_min(bead_min, idx, bid)
+                        wp.atomic_max(bead_max, idx, bid)
+                        if sflags != 0:
+                            wp.atomic_or(seg_flag_arr, idx, sflags)
 
     @wp.kernel
     def _pack_brick_slab_kernel(
@@ -248,6 +265,9 @@ try:
         cov_sum: wp.array(dtype=wp.int32, ndim=2),
         feat_arr: wp.array(dtype=wp.int32, ndim=2),
         multi_arr: wp.array(dtype=wp.int32, ndim=2),
+        bead_min: wp.array(dtype=wp.int32, ndim=2),
+        bead_max: wp.array(dtype=wp.int32, ndim=2),
+        seg_flag_arr: wp.array(dtype=wp.int32, ndim=2),
         slab_masks: wp.array(dtype=wp.uint64, ndim=1),
         slab_payload: wp.array(dtype=wp.uint32, ndim=2),
     ):
@@ -282,11 +302,14 @@ try:
                         if abin < 0:
                             abin = abin + n_bins
                         feat_code = feat_arr[lz, idx] & 0x07
-                        flags = (feat_code << 1)
+                        flags = feat_code << 1
                         if cov_sum[lz, idx] > pop:
                             flags = flags | 1
                         if multi_arr[lz, idx] > 1:
                             flags = flags | 16
+                        if bead_max[lz, idx] > bead_min[lz, idx]:
+                            flags = flags | 64
+                        flags = flags | (seg_flag_arr[lz, idx] & (32 | 128))
                         packed = (
                             wp.uint32(abin)
                             | (wp.uint32(rho_q) << wp.uint32(16))
@@ -534,14 +557,43 @@ def iter_gcode_layers(
         raise ValueError("未找到有效的 G0/G1 挤出线段")
 
 
-def _rasterize_layer_cpu(segs_local, nx, ny, dx, dy, submask, cos2_sum, sin2_sum, cov_sum, feat_arr):
+def _annotate_layer_segment_flags(segs, seam_zone_dist_mm=1.0):
+    """Mark bead start/stop zones and closed-loop Z-seams per bead in a layer."""
+    n = len(segs)
+    flags = np.zeros(n, dtype=np.int32)
+    if n == 0:
+        return flags
+    bids = segs[:, 6].astype(np.int64)
+    split_pts = np.flatnonzero(bids[1:] != bids[:-1]) + 1
+    starts = np.r_[0, split_pts]
+    ends = np.r_[split_pts, n]
+    for s0, s1 in zip(starts, ends):
+        sub = segs[s0:s1]
+        lens = np.hypot(sub[:, 2] - sub[:, 0], sub[:, 3] - sub[:, 1])
+        cum_end = np.cumsum(lens)
+        cum_start = cum_end - lens
+        tot_len = float(cum_end[-1])
+        w_m = float(np.median(sub[:, 4]))
+        end_mask = (cum_start < seam_zone_dist_mm) | (cum_end > max(0.0, tot_len - seam_zone_dist_mm))
+        flags[s0:s1][end_mask] |= FLAG_START_STOP_ZONE
+        gap = math.hypot(float(sub[-1, 2] - sub[0, 0]), float(sub[-1, 3] - sub[0, 1]))
+        if tot_len > 2.5 * w_m and gap <= max(0.8, 1.8 * w_m):
+            seam_dist = max(0.5 * w_m, 0.4)
+            seam_mask = (cum_start < seam_dist) | (cum_end > max(0.0, tot_len - seam_dist))
+            flags[s0:s1][seam_mask] |= FLAG_SEAM_LOOP
+    return flags
+
+
+def _rasterize_layer_cpu(
+    segs_local, seg_meta, nx, ny, dx, dy, submask, cos2_sum, sin2_sum, cov_sum, feat_arr, bead_min, bead_max, seg_flag_arr
+):
     """Pure-NumPy vectorized fallback if Warp is not used."""
     sub_offsets = (np.arange(4, dtype=np.float64) + 0.5) * 0.25
     gx, gy = np.meshgrid(sub_offsets * dx, sub_offsets * dy)
     sub_dx = gx.ravel()[None, :]  # (1, 16)
     sub_dy = gy.ravel()[None, :]  # (1, 16)
     bits = (np.uint32(1) << np.arange(16, dtype=np.uint32))[None, :]
-    for x0, y0, x1, y1, r, fprio in segs_local:
+    for (x0, y0, x1, y1, r, fprio), (bid, sflags) in zip(segs_local, seg_meta):
         vx = x1 - x0
         vy = y1 - y0
         len2 = vx * vx + vy * vy
@@ -581,9 +633,15 @@ def _rasterize_layer_cpu(segs_local, nx, ny, dx, dy, submask, cos2_sum, sin2_sum
         sin2_sum[idx] += pop.astype(np.float32) * np.float32(sin2)
         cov_sum[idx] += pop
         feat_arr[idx] = np.maximum(feat_arr[idx], int(fprio))
+        bead_min[idx] = np.minimum(bead_min[idx], int(bid))
+        bead_max[idx] = np.maximum(bead_max[idx], int(bid))
+        if int(sflags):
+            seg_flag_arr[idx] |= int(sflags)
 
 
-def _pack_slab_numpy(nx, ny, nbx, n_bins, submask, cos2_sum, sin2_sum, cov_sum, feat_arr, multi_arr):
+def _pack_slab_numpy(
+    nx, ny, nbx, n_bins, submask, cos2_sum, sin2_sum, cov_sum, feat_arr, multi_arr, bead_min, bead_max, seg_flag_arr
+):
     """NumPy fallback to pack 4 Z-slices into non-empty 4x4x4 bricks."""
     nby = ny // 4
     sm4 = submask.reshape(4, nby, 4, nbx, 4).transpose(1, 3, 0, 2, 4).reshape(nby * nbx, 64)
@@ -600,6 +658,9 @@ def _pack_slab_numpy(nx, ny, nbx, n_bins, submask, cos2_sum, sin2_sum, cov_sum, 
     cov_a = cov_sum.reshape(4, nby, 4, nbx, 4).transpose(1, 3, 0, 2, 4).reshape(nby * nbx, 64)[active_b]
     ft_a = feat_arr.reshape(4, nby, 4, nbx, 4).transpose(1, 3, 0, 2, 4).reshape(nby * nbx, 64)[active_b]
     mu_a = multi_arr.reshape(4, nby, 4, nbx, 4).transpose(1, 3, 0, 2, 4).reshape(nby * nbx, 64)[active_b]
+    bmin_a = bead_min.reshape(4, nby, 4, nbx, 4).transpose(1, 3, 0, 2, 4).reshape(nby * nbx, 64)[active_b]
+    bmax_a = bead_max.reshape(4, nby, 4, nbx, 4).transpose(1, 3, 0, 2, 4).reshape(nby * nbx, 64)[active_b]
+    sflag_a = seg_flag_arr.reshape(4, nby, 4, nbx, 4).transpose(1, 3, 0, 2, 4).reshape(nby * nbx, 64)[active_b]
 
     occ = sm_a != 0
     bit_weights = np.uint64(1) << np.arange(64, dtype=np.uint64)
@@ -609,7 +670,13 @@ def _pack_slab_numpy(nx, ny, nbx, n_bins, submask, cos2_sum, sin2_sum, cov_sum, 
     theta = 0.5 * np.arctan2(s2_a, c2_a)
     abin = angle_to_bin(theta, n_bins)
     fcode = ft_a & 0x07
-    flags = (fcode << 1) | (cov_a > pop).astype(np.int32) | ((mu_a > 1).astype(np.int32) << 4)
+    flags = (
+        (fcode << 1)
+        | (cov_a > pop).astype(np.int32)
+        | ((mu_a > 1).astype(np.int32) << 4)
+        | ((bmax_a > bmin_a).astype(np.int32) * FLAG_BEAD_INTERFACE)
+        | (sflag_a & (FLAG_START_STOP_ZONE | FLAG_SEAM_LOOP))
+    )
     payload = np.where(occ, pack_payload(abin, rho_q, flags), np.uint32(0)).astype(np.uint32)
     by = (active_b // nbx).astype(np.int32)
     bx = (active_b % nbx).astype(np.int32)
@@ -895,6 +962,9 @@ def gcode_to_bricks(
             cov_dev = wp.zeros((4, ny * nx), dtype=wp.int32, device=used_device)
             feat_dev = wp.zeros((4, ny * nx), dtype=wp.int32, device=used_device)
             multi_dev = wp.zeros((4, ny * nx), dtype=wp.int32, device=used_device)
+            bead_min_dev = wp.full((4, ny * nx), 0x7FFFFFFF, dtype=wp.int32, device=used_device)
+            bead_max_dev = wp.zeros((4, ny * nx), dtype=wp.int32, device=used_device)
+            seg_flag_dev = wp.zeros((4, ny * nx), dtype=wp.int32, device=used_device)
             slab_masks_dev = wp.zeros(nby * nbx, dtype=wp.uint64, device=used_device)
             slab_payload_dev = wp.zeros((nby * nbx, 64), dtype=wp.uint32, device=used_device)
         else:
@@ -904,6 +974,9 @@ def gcode_to_bricks(
             cov_np = np.zeros((4, ny * nx), dtype=np.int32)
             feat_np = np.zeros((4, ny * nx), dtype=np.int32)
             multi_np = np.zeros((4, ny * nx), dtype=np.int32)
+            bead_min_np = np.full((4, ny * nx), 0x7FFFFFFF, dtype=np.int32)
+            bead_max_np = np.zeros((4, ny * nx), dtype=np.int32)
+            seg_flag_np = np.zeros((4, ny * nx), dtype=np.int32)
 
         slab_start = 0
         slab_dirty = False
@@ -933,6 +1006,9 @@ def gcode_to_bricks(
                         cov_dev,
                         feat_dev,
                         multi_dev,
+                        bead_min_dev,
+                        bead_max_dev,
+                        seg_flag_dev,
                         slab_masks_dev,
                         slab_payload_dev,
                     ],
@@ -951,15 +1027,17 @@ def gcode_to_bricks(
                     coords = np.empty((0, 3), dtype=np.int32)
                     masks = np.empty((0,), dtype=np.uint64)
                     payload = np.empty((0, 64), dtype=np.uint32)
-                for buf in (submask_dev, cos2_dev, sin2_dev, cov_dev, feat_dev, multi_dev):
+                for buf in (submask_dev, cos2_dev, sin2_dev, cov_dev, feat_dev, multi_dev, bead_max_dev, seg_flag_dev):
                     buf.zero_()
+                bead_min_dev.fill_(0x7FFFFFFF)
             else:
                 coords, masks, payload = _pack_slab_numpy(
-                    nx, ny, nbx, n_bins, submask_np, cos2_np, sin2_np, cov_np, feat_np, multi_np
+                    nx, ny, nbx, n_bins, submask_np, cos2_np, sin2_np, cov_np, feat_np, multi_np, bead_min_np, bead_max_np, seg_flag_np
                 )
                 coords[:, 2] = bz
-                for buf in (submask_np, cos2_np, sin2_np, cov_np, feat_np, multi_np):
+                for buf in (submask_np, cos2_np, sin2_np, cov_np, feat_np, multi_np, bead_max_np, seg_flag_np):
                     buf.fill(0)
+                bead_min_np.fill(0x7FFFFFFF)
 
             if len(coords):
                 sf = scratch_dir / f"slab_{bz:05d}.bin"
@@ -992,7 +1070,7 @@ def gcode_to_bricks(
             else:
                 iz_list = list(range(iz_lo, iz_hi + 1))
 
-            # Build local-origin segment array [x0, y0, x1, y1, radius, packed_feat_prio]
+            # Build local-origin segment array [x0, y0, x1, y1, radius, packed_feat_prio] + seg_meta [bead_id, seg_flags]
             seg_local = np.empty((len(segs), 6), dtype=np.float32)
             seg_local[:, 0] = (segs[:, 0] - origin_x).astype(np.float32)
             seg_local[:, 1] = (segs[:, 1] - origin_y).astype(np.float32)
@@ -1002,8 +1080,13 @@ def gcode_to_bricks(
             fc = segs[:, 5].astype(np.int32)
             seg_local[:, 5] = (prio_lut[np.clip(fc, 0, 7)].astype(np.int32) << 4) | (fc & 0x07)
 
+            seg_meta_np = np.empty((len(segs), 2), dtype=np.int32)
+            seg_meta_np[:, 0] = segs[:, 6].astype(np.int32)
+            seg_meta_np[:, 1] = _annotate_layer_segment_flags(segs)
+
             if use_warp:
                 seg_dev = wp.array(seg_local, dtype=wp.float32, device=used_device)
+                seg_meta_dev = wp.array(seg_meta_np, dtype=wp.int32, device=used_device)
 
             for iz in iz_list:
                 while iz >= slab_start + 4:
@@ -1017,6 +1100,7 @@ def gcode_to_bricks(
                         dim=len(seg_local),
                         inputs=[
                             seg_dev,
+                            seg_meta_dev,
                             nx,
                             ny,
                             np.float32(dx),
@@ -1026,6 +1110,9 @@ def gcode_to_bricks(
                             sin2_dev[sz],
                             cov_dev[sz],
                             feat_dev[sz],
+                            bead_min_dev[sz],
+                            bead_max_dev[sz],
+                            seg_flag_dev[sz],
                         ],
                         device=used_device,
                     )
@@ -1033,6 +1120,7 @@ def gcode_to_bricks(
                 else:
                     _rasterize_layer_cpu(
                         seg_local,
+                        seg_meta_np,
                         nx,
                         ny,
                         dx,
@@ -1042,6 +1130,9 @@ def gcode_to_bricks(
                         sin2_np[sz],
                         cov_np[sz],
                         feat_np[sz],
+                        bead_min_np[sz],
+                        bead_max_np[sz],
+                        seg_flag_np[sz],
                     )
                     multi_np[sz][submask_np[sz] != 0] += 1
 
@@ -1049,7 +1140,19 @@ def gcode_to_bricks(
 
         # Free device scratch buffers immediately before connectivity assembly.
         if use_warp:
-            del submask_dev, cos2_dev, sin2_dev, cov_dev, feat_dev, multi_dev, slab_masks_dev, slab_payload_dev
+            del (
+                submask_dev,
+                cos2_dev,
+                sin2_dev,
+                cov_dev,
+                feat_dev,
+                multi_dev,
+                bead_min_dev,
+                bead_max_dev,
+                seg_flag_dev,
+                slab_masks_dev,
+                slab_payload_dev,
+            )
 
         # Stream-read spilled slab files into compact brick arrays.
         coords_list, masks_list, payload_list = [], [], []
@@ -1093,9 +1196,13 @@ def gcode_to_bricks(
         FEATURE_NAMES[k]: int((feats_active == k).sum()) for k in sorted(FEATURE_NAMES) if (feats_active == k).any()
     }
     overlap_fraction = float(np.mean((flags_active & FLAG_BEAD_OVERLAP) != 0))
+    start_stop_count = int((flags_active & FLAG_START_STOP_ZONE).astype(bool).sum())
+    bead_iface_count = int((flags_active & FLAG_BEAD_INTERFACE).astype(bool).sum())
+    seam_loop_count = int((flags_active & FLAG_SEAM_LOOP).astype(bool).sum())
     elapsed = time.perf_counter() - t0
 
     meta = {
+        "flags_version": 2,
         "source_gcode": str(gcode_path.resolve()),
         "source_sha256": src_hash.hexdigest(),
         "layer_count": len(layer_records),
@@ -1113,6 +1220,9 @@ def gcode_to_bricks(
         "full_voxel_volume_mm3": full_voxel_volume,
         "mean_rho": float(rho_active.mean()),
         "overlap_voxel_fraction": overlap_fraction,
+        "start_stop_voxel_count": start_stop_count,
+        "bead_interface_voxel_count": bead_iface_count,
+        "seam_loop_voxel_count": seam_loop_count,
         "feature_voxel_counts": feature_counts,
         "connectivity": conn_info,
         "rasterize_device": used_device if use_warp else "cpu_numpy",

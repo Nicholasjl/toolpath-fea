@@ -1,5 +1,20 @@
 # Agent 调用协议 v1.0
 
+## 走线级 GPU/CPU 引擎集成（2026-11-19，默认选用新引擎）
+
+安装可选 GPU/CPU 内核依赖：`python -m pip install -r requirements-gpu.txt`（`warp-lang>=1.7`，同时支持 `cuda:0` 独显加速与无独显 `cpu` LLVM 多线程执行）。
+
+### 引擎选择与回落规则
+- 工况字段 `engine` 与 CLI 参数 `--engine` 取值：`auto`（默认） / `toolpath_graph` / `toolpath_hex` / `legacy_solid`。
+- 当 `engine="auto"` 且提供 `gcode`（未启用 `--angles`）时，自动选用 **`toolpath_graph`**；无 `gcode`（仅 STL 或测试块）或启用 `--angles` 时自动使用 **`legacy_solid`**。
+- 显式指定 `toolpath_graph` / `toolpath_hex` 时必须提供有效的平面 `gcode` 且不能使用 `--angles`，否则以 `INVALID_CASE`（退出码 `2`）拒绝。
+- `device` / `--device`（`auto` | `cuda:0` | `cpu`，默认 `auto`）控制 Warp 执行后端；`legacy_solid` 忽略 `--device`。
+
+### 新增 `case.schema.json` 字段与 Artifacts
+- `toolpath_pitch_mm`（`0.05–2.0`，默认 `0.2`）、`toolpath_dz_mm`（可 `null`）、`toolpath_max_seg_len_mm`（`0.1–5.0`，默认 `1.0`）、`toolpath_cache_path`（相对工况目录的可选 `.tgraph`/`.tbricks` 缓存路径）、`spill_stress`（布尔值，是否写出 `graph_stress.bin` / `stress_fields.bin`）、`keep_largest_component`（默认 `true`）。
+- `seam_config`（`ideal` 及接缝/启停/焊缝/冷却 `thermal_decay_tau_s`/标定因子）、`strength_config`（基准允许应力与 `strength_scale_exponent`）、`hex_interface_config`（`weakened` 及 H8 路线 2 界面弱化因子）。
+- 清单增加 `analysis.engine` 与 `analysis.requested_engine`；`toolpath_graph` / `toolpath_hex` 输出 `preview.png`、`report.html`、`analysis.json`、`model.tgraph` 或 `model.tbricks`（及可选应力二进制），`EQUILIBRIUM` 仍严格按 `fp64` 原始系统残差 `< 1e-6` 与总力/总力矩平衡 `< 1e-6` 审计。`TOOLPATH_MODEL_SCOPE` 诚实保持 `warn`（`quality="needs_review"`），明确说明基准强度/界面因子未经实验标定、不含非线性断裂。
+
 ## 稳健贴体网格和分离安装区（2026-11-16）
 
 安装可选后端：`python -m pip install -r requirements-robust.txt`。

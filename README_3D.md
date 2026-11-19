@@ -41,6 +41,22 @@ CLI 已升级为 Agent 接口，默认额外求解一档细化网格，并生成
 
 三维正交各向异性柔度参考：[Sandia LAMÉ 三维正交各向异性模型](https://www.sandia.gov/files/sierra/SM_LAME_5_26/main/models/elastic_3D_ortho.html)。本工具独立使用 NumPy/SciPy 实现，局部工程应变顺序为 xx,yy,zz,xy,yz,xz；刚度以 Tᵀ D T 映射。
 
+## 2026-11-19 走线级双引擎接入（默认新引擎 / 参数切换）
+
+在安装 `requirements-gpu.txt`（`warp-lang`）后，`run3d.py` 与 `case.schema.json` 支持按 `engine` 参数选择求解器（支持 `--device auto|cuda:0|cpu`，有独显自动 GPU，无独显自动多线程 CPU）：
+
+1. **`engine="auto"`（默认）**：若工况提供 `gcode` 且未使用 `--angles`，自动选用 **`toolpath_graph`**；仅有 `stl`/测试块或使用 `--angles` 时自动回落到 **`legacy_solid`**（`tetra` / `voxel`）。
+2. **`toolpath_graph`（6-DOF 走线丝束-焊缝网络）**：
+   - 将连续挤出轨迹离散为 3D Timoshenko 梁与偏心界面耦合器，不合并闭环首尾，显式区分 `seam_closed`、`seam_scarf`、`start_anchor`、`stop_anchor`、`lateral`、`interlayer`；
+   - 可选 `seam_config`（接缝/启停折减系数、`thermal_decay_tau_s` 层间冷却衰减、`beam_calibration_factor`/`bond_calibration_factor` 连续体标定系数）与 `strength_config`（输出未标定基准失效指数 `failure_index` 与名义安全系数 `fos`）；
+   - 独立入口 `run_toolpath_graph.py` 另提供 `--calibrate-from-hex-summary` 一键对标 `0.2 mm H8` 功共轭位移并校准网络刚度。
+3. **`toolpath_hex`（0.2 mm GPU H8 走线体素）**：
+   - 流式两趟光栅化 + `4×4` 子采样 -> `4×4×4` 稀疏砖块 + 8 色无矩阵多重网格 PCG + 外层 `fp64` 截断 FCG，支持 `hex_interface_config`（路线 2 启停区/道间交界面/Z-seam/层间弱化）；
+   - 独立入口 `run_toolpath_gpu.py` 支持直接批量扫描与 `.tbricks` 复用。
+4. **`legacy_solid`**：保留旧版贴体四面体（TetGen / TetWild）与 STL 体素路径，用于无 G-code 纯 STL 阶段、桌面端 `app3d.py` 与统一角度对比。
+
+> **结果边界**：`toolpath_graph` 的默认 `SeamConfig` / `StrengthConfig` 与 `toolpath_hex` 的 `HexInterfaceConfig` 均为数值筛查参考值，未经特定耗材与工艺试验标定前不能当作绝对强度或断裂寿命预测；线弹性模型不包含塑性、接触或动态裂纹扩展。
+
 ## 2026-11-09 网格默认值修正
 
 STL 默认使用 `tetra`，TetGen 使用 `pq1.4Q`，允许边界细分并真正启用质量细化。目标网格尺度默认2mm；需通过默认两档细化检查判断是否足够。桌面默认也执行两档比较，显示未通过/未检查项目；可显式关闭。体素模式仍可手动选择。

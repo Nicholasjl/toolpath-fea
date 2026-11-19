@@ -11,9 +11,10 @@ description: 使用本地 PathFEA 对 3D 打印零件进行考虑走线方向的
 
 求解器位于包含此 skill 的仓库根目录（从当前文件向上两级目录），也可使用用户指定的克隆路径。本机历史路径为 `D:/3d/toolpath_fea`；安装 skill 到全局目录后，需定位实际克隆目录。先确认路径存在，阅读项目 `AGENT_API.md` 和当前 `case.schema.json`；以当前实现为准。若迁移机器，定位实际项目或向用户索取项目位置，不凭空声称已安装求解器。
 
-- Agent 使用 `run3d.py`；桌面入口 `start3d.cmd`。
-- 配置由 `agent_worker.py` 校验；核心为 `solid.py`、`numerics.py`、`meshing.py`。
-- 修改求解器时运行相关回归测试；单纯改变工况时检查新结果即可。
+- Agent 使用 `run3d.py`；桌面入口 `start3d.cmd`（桌面端仍运行旧版 `tetra`/`voxel` 引擎）。
+- **引擎路由（2026-11-19 起默认新引擎）**：传入 `gcode` 且未用 `--angles` 时，`run3d.py`（`engine="auto"`）默认启用 **`toolpath_graph`**（6-DOF 丝束-焊缝网络，显式建模 Z-seam / Scarf / 启停点 / 热衰减 / FoS）；需要 0.2 mm 连续体体素基准或路线 2 界面弱化对比时传 `--engine toolpath_hex`；仅提供 STL / 测试块或需要统一 `--angles` 时自动（或 `--engine legacy_solid`）运行 `solid.py` / `meshing.py`。无独显环境支持传 `--device cpu`。
+- 独立高频调参入口：`run_toolpath_graph.py`（支持 `--calibrate-from-hex-summary` 对标 H8 刚度）和 `run_toolpath_gpu.py`。
+- 配置由 `agent_worker.py` 校验；修改任何求解器后必须运行全部回归测试 `python -m unittest discover -p "test_*.py"`。
 - 复用洞洞板基线时读 [references/g5-baseline.md](references/g5-baseline.md)。其他零件不要继承此例的材料、底部夹紧或加载孔位。
 
 ## 建立工况

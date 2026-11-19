@@ -128,6 +128,8 @@ def main(argv=None):
     parser.add_argument('--no-convergence',action='store_true',help='关闭默认两档网格对比；标记为 not_checked')
     parser.add_argument('--angles',help='对比统一走线角，如 0,45,90；不能与 G-code 同用')
     parser.add_argument('--require-checks',action='store_true',help='存在警告或未校核项时返回退出码 8')
+    parser.add_argument('--engine',choices=['auto','toolpath_graph','toolpath_hex','legacy_solid'],default=None,help='求解引擎（auto 在提供 G-code 时默认启用 toolpath_graph）')
+    parser.add_argument('--device',choices=['auto','cuda:0','cpu'],default=None,help='Warp 计算后端（toolpath_graph / toolpath_hex）')
     args=None
     try:
         args=parser.parse_args(argv)
@@ -143,8 +145,12 @@ def main(argv=None):
         try:cfg=json.loads(Path(args.case).read_text(encoding='utf-8-sig'),parse_constant=lambda v:(_ for _ in ()).throw(ValueError(f'非法常数 {v}')))
         except (ValueError,UnicodeError) as exc:raise CliError(f'INVALID_JSON: {exc}') from exc
         if isinstance(cfg,dict) and cfg.get('gcode') and angles:raise CliError('G-code 与 angles 不能同时使用')
+        req_engine=args.engine if args.engine is not None else (cfg.get('engine') if isinstance(cfg,dict) else None)
+        if req_engine in ('toolpath_graph','toolpath_hex') and angles:
+            raise CliError(f'引擎 {req_engine} 与 angles 不能同时使用')
         options=dict(timeout=args.timeout,memory_mb=args.memory_mb,cancel_file=str(Path(args.cancel_file).resolve()) if args.cancel_file else None,
-                     convergence=not args.no_convergence,angles=angles,require_checks=args.require_checks)
+                     convergence=not args.no_convergence,angles=angles,require_checks=args.require_checks,
+                     engine=args.engine,device=args.device)
         result=supervise(cfg,str(Path(args.case).resolve().parent),args.output,options)
     except Exception as exc:
         if isinstance(exc,CliError):code='INVALID_JSON' if str(exc).startswith('INVALID_JSON:') else 'INVALID_CASE'

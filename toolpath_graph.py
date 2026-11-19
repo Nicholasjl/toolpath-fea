@@ -60,7 +60,7 @@ BOND_TYPE_NAMES = {
 
 @dataclass
 class SeamConfig:
-    """Explicit stiffness scaling factors for seams, start/stop zones, and welds."""
+    """Explicit stiffness scaling factors for seams, start/stop zones, welds, and calibration."""
 
     seam_stiffness_factor: float = 0.5
     scarf_seam_stiffness_factor: float = 0.85
@@ -72,9 +72,11 @@ class SeamConfig:
     interlayer_weld_factor: float = 0.85
     thermal_decay_tau_s: float = 0.0
     thermal_min_factor: float = 0.35
+    beam_calibration_factor: float = 1.0
+    bond_calibration_factor: float = 1.0
 
     @classmethod
-    def ideal(cls):
+    def ideal(cls, beam_calibration_factor: float = 1.0, bond_calibration_factor: float = 1.0):
         return cls(
             seam_stiffness_factor=1.0,
             scarf_seam_stiffness_factor=1.0,
@@ -85,7 +87,34 @@ class SeamConfig:
             lateral_weld_factor=1.0,
             interlayer_weld_factor=1.0,
             thermal_decay_tau_s=0.0,
+            beam_calibration_factor=float(beam_calibration_factor),
+            bond_calibration_factor=float(bond_calibration_factor),
         )
+
+    @classmethod
+    def from_dict(cls, data):
+        if data is None:
+            return cls()
+        if not isinstance(data, dict):
+            raise ValueError("seam_config must be a JSON object")
+        d = dict(data)
+        use_ideal = bool(d.pop("ideal", False))
+        cfg = cls.ideal() if use_ideal else cls()
+        valid = set(cls.__dataclass_fields__)
+        unknown = set(d) - valid
+        if unknown:
+            raise ValueError(f"Unknown seam_config keys: {sorted(unknown)}")
+        for k, v in d.items():
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError(f"seam_config.{k} must be finite")
+            if k == "thermal_decay_tau_s":
+                if fv < 0.0:
+                    raise ValueError("seam_config.thermal_decay_tau_s must be >= 0")
+            elif fv <= 0.0:
+                raise ValueError(f"seam_config.{k} must be positive")
+            setattr(cfg, k, fv)
+        return cfg
 
     def to_dict(self):
         return {
@@ -99,6 +128,53 @@ class SeamConfig:
             "interlayer_weld_factor": float(self.interlayer_weld_factor),
             "thermal_decay_tau_s": float(self.thermal_decay_tau_s),
             "thermal_min_factor": float(self.thermal_min_factor),
+            "beam_calibration_factor": float(self.beam_calibration_factor),
+            "bond_calibration_factor": float(self.bond_calibration_factor),
+        }
+
+
+@dataclass
+class StrengthConfig:
+    """Reference allowables for screening failure index / FoS (uncalibrated reference values)."""
+
+    sigma_beam_allow_MPa: float = 45.0
+    sigma_interlayer_allow_MPa: float = 18.0
+    tau_interlayer_allow_MPa: float = 14.0
+    sigma_lateral_allow_MPa: float = 24.0
+    tau_lateral_allow_MPa: float = 18.0
+    strength_scale_exponent: float = 1.0
+
+    @classmethod
+    def from_dict(cls, data):
+        if data is None:
+            return cls()
+        if not isinstance(data, dict):
+            raise ValueError("strength_config must be a JSON object")
+        valid = set(cls.__dataclass_fields__)
+        unknown = set(data) - valid
+        if unknown:
+            raise ValueError(f"Unknown strength_config keys: {sorted(unknown)}")
+        cfg = cls()
+        for k, v in data.items():
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError(f"strength_config.{k} must be finite")
+            if k == "strength_scale_exponent":
+                if not 0.0 <= fv <= 3.0:
+                    raise ValueError("strength_config.strength_scale_exponent must be in [0, 3]")
+            elif fv <= 0.0:
+                raise ValueError(f"strength_config.{k} must be positive")
+            setattr(cfg, k, fv)
+        return cfg
+
+    def to_dict(self):
+        return {
+            "sigma_beam_allow_MPa": float(self.sigma_beam_allow_MPa),
+            "sigma_interlayer_allow_MPa": float(self.sigma_interlayer_allow_MPa),
+            "tau_interlayer_allow_MPa": float(self.tau_interlayer_allow_MPa),
+            "sigma_lateral_allow_MPa": float(self.sigma_lateral_allow_MPa),
+            "tau_lateral_allow_MPa": float(self.tau_lateral_allow_MPa),
+            "strength_scale_exponent": float(self.strength_scale_exponent),
         }
 
 

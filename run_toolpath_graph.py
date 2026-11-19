@@ -7,7 +7,11 @@ import time
 
 import numpy as np
 
-from beam_bond_solver import recover_graph_stress_streaming, solve_toolpath_graph_gpu
+from beam_bond_solver import (
+    calibrate_graph_to_continuum,
+    recover_graph_stress_streaming,
+    solve_toolpath_graph_gpu,
+)
 from solid import Material
 from toolpath_graph import (
     BOND_INTERLAYER,
@@ -17,6 +21,7 @@ from toolpath_graph import (
     BOND_START_ANCHOR,
     BOND_STOP_ANCHOR,
     SeamConfig,
+    StrengthConfig,
     gcode_to_toolpath_graph,
     load_toolpath_graph,
 )
@@ -111,32 +116,33 @@ def render_graph_preview(graph, result, stress_summary, out_png, pixel_mm=0.25):
     bg_img = np.where(bg_mask, 0.88, 0.97)
     ax2.imshow(bg_img, origin="lower", extent=extent, cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
     seam_mask = np.isin(graph.bond_type, [BOND_SEAM_CLOSED, BOND_SEAM_SCARF, BOND_START_ANCHOR, BOND_STOP_ANCHOR])
+    use_fi = "_bond_fi" in stress_summary
     if seam_mask.any():
         s_pc = graph.bond_pc[seam_mask]
-        s_eq = stress_summary["_bond_eq_peak"][seam_mask]
-        order = np.argsort(s_eq)
+        s_val = stress_summary["_bond_fi"][seam_mask] if use_fi else stress_summary["_bond_eq_peak"][seam_mask]
+        order = np.argsort(s_val)
         if len(order) > 15000:
             # Keep background subsample + top 4000 hottest seams/anchors
             bg_sub = order[: len(order) - 4000 : max(1, (len(order) - 4000) // 6000)]
             order = np.concatenate([bg_sub, order[-4000:]])
         s_pc = s_pc[order]
-        s_eq = s_eq[order]
-        vmax2 = max(float(np.percentile(s_eq, 99.5)), 1e-6)
+        s_val = s_val[order]
+        vmax2 = max(float(np.percentile(s_val, 99.5)), 1e-6)
         sc = ax2.scatter(
             s_pc[:, 0],
             s_pc[:, 1],
-            c=s_eq,
+            c=s_val,
             cmap="inferno",
             vmin=0.0,
             vmax=vmax2,
-            s=4.0 + 18.0 * np.clip(s_eq / vmax2, 0.0, 1.0),
+            s=4.0 + 18.0 * np.clip(s_val / vmax2, 0.0, 1.0),
             alpha=0.85,
             linewidths=0.0,
         )
         fig.colorbar(sc, ax=ax2, fraction=0.045, pad=0.03)
     ax2.set_xlim(extent[0], extent[1])
     ax2.set_ylim(extent[2], extent[3])
-    ax2.set_title("Start/Stop & Z-Seam Eq. Traction (MPa)", fontsize=10)
+    ax2.set_title("Start/Stop & Z-Seam Failure Index (FI)" if use_fi else "Start/Stop & Z-Seam Eq. Traction (MPa)", fontsize=10)
     ax2.set_xlabel("X / mm")
     ax2.set_ylabel("Y / mm")
 
@@ -149,6 +155,8 @@ def run_graph_case(
     output_dir="output/toolpath_graph",
     graph_cache=None,
     seam_cfg: SeamConfig = None,
+    strength_cfg: StrengthConfig = None,
+    calibrate_hex_summary=None,
     device="auto",
     rtol=1e-7,
     spill_stress=False,
@@ -196,15 +204,48 @@ def run_graph_case(
         )
 
     material = Material(**cfg.get("material", {}))
-    seam_cfg = seam_cfg or SeamConfig()
+    seam_cfg = SeamConfig.from_dict(seam_cfg.to_dict()) if seam_cfg is not None else SeamConfig()
+    strength_cfg = strength_cfg or StrengthConfig()
+    fixed = cfg.get("fixed", "X-")
+    loaded = cfg.get("loaded", "X+")
+    force = cfg.get("force", [0.0, 0.0, -10.0])
+    load_point = cfg.get("load_point")
+
+    calibration_info = None
+    if calibrate_hex_summary is not None:
+        hex_p = Path(calibrate_hex_summary).resolve()
+        hex_data = json.loads(hex_p.read_text(encoding="utf-8-sig"))
+        target_wu = (
+            hex_data.get("solver", {}).get("work_conjugate_displacement_mm")
+            or hex_data.get("analysis", {}).get("metrics", {}).get("work_conjugate_displacement_mm")
+        )
+        if target_wu is None:
+            raise ValueError(f"Could not find work_conjugate_displacement_mm in {hex_p}")
+        cal_cfg, cal_audit = calibrate_graph_to_continuum(
+            graph,
+            material,
+            target_wu,
+            fixed=fixed,
+            loaded=loaded,
+            force=force,
+            load_point=load_point,
+            base_seam_cfg=SeamConfig.ideal(),
+            device=device,
+            mode="split",
+            rtol=rtol,
+        )
+        seam_cfg.beam_calibration_factor = cal_cfg.beam_calibration_factor
+        seam_cfg.bond_calibration_factor = cal_cfg.bond_calibration_factor
+        calibration_info = {"hex_summary_path": str(hex_p), **cal_audit}
+
     result = solve_toolpath_graph_gpu(
         graph,
         material=material,
         seam_cfg=seam_cfg,
-        fixed=cfg.get("fixed", "X-"),
-        loaded=cfg.get("loaded", "X+"),
-        force=cfg.get("force", [0.0, 0.0, -10.0]),
-        load_point=cfg.get("load_point"),
+        fixed=fixed,
+        loaded=loaded,
+        force=force,
+        load_point=load_point,
         rtol=rtol,
         device=device,
     )
@@ -215,6 +256,7 @@ def run_graph_case(
         result["displacement_6dof"],
         material=material,
         seam_cfg=seam_cfg,
+        strength_cfg=strength_cfg,
         spill_path=spill_file,
     )
 
@@ -231,12 +273,13 @@ def run_graph_case(
         "graph_cache_hit": cache_hit,
         "graph_file_mib": float(cache_path.stat().st_size / 1024**2),
         "graph": graph.meta,
+        "calibration": calibration_info,
         "solver": result["solver_info"],
         "stress": stress_json,
         "preview_png": str(preview_path) if render_preview else None,
         "end_to_end_seconds": time.perf_counter() - t0,
     }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
     return summary
 
 
@@ -256,6 +299,15 @@ def main(argv=None):
     parser.add_argument("--lateral-factor", type=float, default=0.85)
     parser.add_argument("--interlayer-factor", type=float, default=0.85)
     parser.add_argument("--thermal-tau", type=float, default=0.0)
+    parser.add_argument("--beam-cal", type=float, default=1.0)
+    parser.add_argument("--bond-cal", type=float, default=1.0)
+    parser.add_argument("--calibrate-from-hex-summary", default=None)
+    parser.add_argument("--sigma-beam-allow", type=float, default=45.0)
+    parser.add_argument("--sigma-interlayer-allow", type=float, default=18.0)
+    parser.add_argument("--tau-interlayer-allow", type=float, default=14.0)
+    parser.add_argument("--sigma-lateral-allow", type=float, default=24.0)
+    parser.add_argument("--tau-lateral-allow", type=float, default=18.0)
+    parser.add_argument("--strength-exp", type=float, default=1.0)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda:0", "cpu"])
     parser.add_argument("--rtol", type=float, default=1e-7)
     parser.add_argument("--spill-stress", action="store_true")
@@ -264,7 +316,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     seam_cfg = (
-        SeamConfig.ideal()
+        SeamConfig.ideal(beam_calibration_factor=args.beam_cal, bond_calibration_factor=args.bond_cal)
         if args.ideal
         else SeamConfig(
             seam_stiffness_factor=args.seam_factor,
@@ -276,7 +328,17 @@ def main(argv=None):
             lateral_weld_factor=args.lateral_factor,
             interlayer_weld_factor=args.interlayer_factor,
             thermal_decay_tau_s=args.thermal_tau,
+            beam_calibration_factor=args.beam_cal,
+            bond_calibration_factor=args.bond_cal,
         )
+    )
+    strength_cfg = StrengthConfig(
+        sigma_beam_allow_MPa=args.sigma_beam_allow,
+        sigma_interlayer_allow_MPa=args.sigma_interlayer_allow,
+        tau_interlayer_allow_MPa=args.tau_interlayer_allow,
+        sigma_lateral_allow_MPa=args.sigma_lateral_allow,
+        tau_lateral_allow_MPa=args.tau_lateral_allow,
+        strength_scale_exponent=args.strength_exp,
     )
     summary = run_graph_case(
         args.case,
@@ -284,13 +346,15 @@ def main(argv=None):
         output_dir=args.output,
         graph_cache=args.graph_cache,
         seam_cfg=seam_cfg,
+        strength_cfg=strength_cfg,
+        calibrate_hex_summary=args.calibrate_from_hex_summary,
         device=args.device,
         rtol=args.rtol,
         spill_stress=args.spill_stress,
         keep_largest_component=not args.no_keep_largest,
         render_preview=not args.no_preview,
     )
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False))
     return 0
 
 

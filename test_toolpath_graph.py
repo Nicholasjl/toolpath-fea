@@ -16,10 +16,13 @@ from beam_bond_solver import (
     _bond_moduli,
     _bond_scale_factors,
     _beam_scale_factors,
+    calibrate_graph_to_continuum,
     recover_graph_stress_streaming,
     solve_toolpath_graph_gpu,
 )
+from gpu_hex_solver import solve_hex_gpu
 from solid import Material
+from toolpath_bricks import gcode_to_bricks
 from toolpath_graph import (
     BOND_INTERLAYER,
     BOND_SEAM_CLOSED,
@@ -30,6 +33,7 @@ from toolpath_graph import (
     NODE_START,
     NODE_STOP,
     SeamConfig,
+    StrengthConfig,
     build_synthetic_graph,
     gcode_to_toolpath_graph,
     load_toolpath_graph,
@@ -404,6 +408,101 @@ class ToolpathGraphTests(unittest.TestCase):
             self.assertGreater(stress_info["beam_von_mises_max_MPa"], 0.0)
             self.assertIn("seam_closed", stress_info["bond_by_type"])
             self.assertIn("interlayer", stress_info["bond_by_type"])
+
+    def test_failure_index_thermal_decay_and_continuum_calibration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gcode_p = Path(tmp) / "coupon.gcode"
+            # 4-layer 10 x 2.0 x 0.8 mm rectangular multi-bead coupon printed slowly (F300) so dt_sec is several seconds
+            lines = ["G21", "G90", "M83", "; LAYER_HEIGHT: 0.2"]
+            for lay in range(4):
+                z = 0.2 * (lay + 1)
+                lines.append(f"; CHANGE_LAYER\nG1 Z{z:.2f} F600")
+                lines.append("; FEATURE: Outer wall\n; LINE_WIDTH: 0.4")
+                # Non-overlapping closed outer perimeter + internal infill beads
+                lines.extend([
+                    "G0 X5.0 Y0.2 F3000",
+                    "G1 X10.0 Y0.2 E0.2 F300",
+                    "G1 X10.0 Y1.8 E0.1",
+                    "G1 X0.0 Y1.8 E0.4",
+                    "G1 X0.0 Y0.2 E0.1",
+                    "G1 X5.0 Y0.2 E0.2",
+                ])
+                lines.append("; FEATURE: Solid infill\n; LINE_WIDTH: 0.4")
+                for y_off in (0.6, 1.0, 1.4):
+                    lines.append(f"G0 X0.35 Y{y_off:.2f} F3000")
+                    lines.append(f"G1 X9.65 Y{y_off:.2f} E0.4 F300")
+            gcode_p.write_text("\n".join(lines), encoding="utf-8")
+
+            graph = gcode_to_toolpath_graph(gcode_p, max_seg_len=0.5)
+            m = Material()
+            strength = StrengthConfig()
+            force = (0.0, 0.0, -0.5)
+
+            # (a) Weakening Z-seam increases failure_index & reduces FoS on seam_closed
+            sc_ideal = SeamConfig.ideal()
+            sc_weak_seam = SeamConfig(
+                seam_stiffness_factor=0.35,
+                scarf_seam_stiffness_factor=1.0,
+                start_anchor_factor=1.0,
+                stop_anchor_factor=1.0,
+                start_zone_beam_factor=1.0,
+                stop_zone_beam_factor=1.0,
+                lateral_weld_factor=1.0,
+                interlayer_weld_factor=1.0,
+            )
+            r_id = solve_toolpath_graph_gpu(graph, m, sc_ideal, fixed="X-", loaded="X+", force=force)
+            st_id = recover_graph_stress_streaming(graph, r_id["displacement_6dof"], m, sc_ideal, strength)
+            r_ws = solve_toolpath_graph_gpu(graph, m, sc_weak_seam, fixed="X-", loaded="X+", force=force)
+            st_ws = recover_graph_stress_streaming(graph, r_ws["displacement_6dof"], m, sc_weak_seam, strength)
+
+            fi_id = st_id["bond_by_type"]["seam_closed"]["failure_index_max"]
+            fi_ws = st_ws["bond_by_type"]["seam_closed"]["failure_index_max"]
+            self.assertGreater(fi_ws, fi_id)
+            self.assertLess(st_ws["bond_by_type"]["seam_closed"]["fos_min"], st_id["bond_by_type"]["seam_closed"]["fos_min"])
+            self.assertEqual(st_ws["strength_config"], strength.to_dict())
+
+            # (b) Turning on thermal_decay_tau_s softens interlayer welds on nonzero dt_sec -> higher compliance & interlayer FI
+            sc_therm = SeamConfig(
+                seam_stiffness_factor=0.35,
+                scarf_seam_stiffness_factor=1.0,
+                start_anchor_factor=1.0,
+                stop_anchor_factor=1.0,
+                start_zone_beam_factor=1.0,
+                stop_zone_beam_factor=1.0,
+                lateral_weld_factor=1.0,
+                interlayer_weld_factor=1.0,
+                thermal_decay_tau_s=10.0,
+            )
+            r_th = solve_toolpath_graph_gpu(graph, m, sc_therm, fixed="X-", loaded="X+", force=force)
+            st_th = recover_graph_stress_streaming(graph, r_th["displacement_6dof"], m, sc_therm, strength)
+            self.assertGreater(r_th["solver_info"]["compliance_mm_per_N"], r_ws["solver_info"]["compliance_mm_per_N"])
+            self.assertGreater(
+                st_th["bond_by_type"]["interlayer"]["failure_index_max"],
+                st_ws["bond_by_type"]["interlayer"]["failure_index_max"],
+            )
+            self.assertTrue(st_th["safety_audit"]["thermal_decay_active"])
+
+            # (c) Calibrate graph against 0.2 mm GPU H8 continuum within < 2% without altering StrengthConfig allowables
+            grid = gcode_to_bricks(gcode_p, pitch=0.2)
+            r_hex = solve_hex_gpu(grid, material=m, fixed="X-", loaded="X+", force=force)
+            target_wu = r_hex["solver_info"]["work_conjugate_displacement_mm"]
+            cal_cfg, cal_audit = calibrate_graph_to_continuum(
+                graph,
+                m,
+                target_wu,
+                fixed="X-",
+                loaded="X+",
+                force=force,
+                base_seam_cfg=SeamConfig.ideal(),
+                mode="split",
+                max_evals=3,
+            )
+            self.assertLess(cal_audit["relative_error"], 0.02)
+            r_cal = solve_toolpath_graph_gpu(graph, m, cal_cfg, fixed="X-", loaded="X+", force=force)
+            wu_cal = r_cal["solver_info"]["work_conjugate_displacement_mm"]
+            self.assertLess(abs(wu_cal - target_wu) / target_wu, 0.02)
+            st_cal = recover_graph_stress_streaming(graph, r_cal["displacement_6dof"], m, cal_cfg, strength)
+            self.assertEqual(st_cal["strength_config"], strength.to_dict())
 
 
 if __name__ == "__main__":
